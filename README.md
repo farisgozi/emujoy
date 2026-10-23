@@ -1,4 +1,4 @@
-# EmuJoy
+# emu-core
 
 A clean-room emulation core built from scratch — first target **Game Boy
 Advance** (acceptance game: *Harvest Moon: Friends of Mineral Town*),
@@ -13,7 +13,34 @@ documented CVEs in file parsers, versionless save states, global state,
 input-latency afterthoughts — and this design answers those problems
 from the first commit instead of patching them later.
 
-## Status: Phase 1 — CPU interpreter ✅ (Phase 0 foundation below)
+## Status: Phase 2 — minimum boot system ✅
+
+- **Timers 0–3** with prescalers, cascade, reload-on-enable, overflow
+  IRQs. **IRQ path end-to-end**: device → IF (write-one-to-clear,
+  intercepted in the bus so CPU acks can't be confused with device
+  flags) → IE/IME gating → CPU exception; without a BIOS the core
+  emulates the BIOS dispatcher contract via the handler pointer at
+  `0x03007FFC`.
+- **DMA 0–3**: immediate + VBlank + HBlank start timing, inc/dec/fixed
+  addressing, 16/32-bit units, completion IRQ, auto-clear of the
+  enable bit for one-shot transfers.
+- **PPU**: real scanline timing (1232×228, DISPSTAT/VCOUNT live),
+  Mode 0 tile backgrounds (4/8bpp, flips, scroll, 512 sizes, priority),
+  Mode 3/4 bitmaps, basic OBJ sprites (1D mapping). `run_frame_cpu()`
+  is the frontend frame loop.
+- **Boot**: `boot_cartridge()` reproduces the BIOS handoff state
+  (stacks, SYS mode, entry 0x08000000); `boot_bios()` runs a
+  user-supplied BIOS dump from address 0.
+- **Verified by 8 Phase 2 tests** (38 total): timer IRQ handler
+  counting + return-to-main, prescaler rate, DMA3 word copy, Mode 3
+  pixels, Mode 0 tile pixels, OBJ over BG, ~1 VBlank IRQ per frame,
+  BIOS handoff state.
+- **Honest limits**: rendering is per-scanline (mid-line effects
+  approximate), no affine/windows/blend/mosaic yet, OBJ priority vs
+  BG layers is simplified, save-state v1 does not yet snapshot the
+  new device state (format v2 bump lands with Phase 3 save hardware).
+
+## Phase 1 — CPU interpreter
 
 - **ARM7TDMI interpreter** (`crates/gba-core/src/cpu/`): complete ARM
   state (data processing + barrel shifter, multiply incl. long,

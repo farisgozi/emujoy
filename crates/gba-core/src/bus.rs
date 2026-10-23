@@ -18,7 +18,11 @@ pub const OAM_LEN: usize = 1024;
 pub const PALETTE_LEN: usize = 1024;
 pub const IO_LEN: usize = 0x400;
 
+pub const BIOS_LEN: usize = 16 * 1024;
+
 pub struct Bus {
+    pub bios: Box<[u8; BIOS_LEN]>,
+    pub bios_loaded: bool,
     pub ewram: Box<[u8; EWRAM_LEN]>,
     pub iwram: Box<[u8; IWRAM_LEN]>,
     pub vram: Box<[u8; VRAM_LEN]>,
@@ -27,11 +31,18 @@ pub struct Bus {
     pub io: Box<[u8; IO_LEN]>,
     rom: Vec<u8>,
     sram: Vec<u8>,
+    /// Interrupt Flag register (0x04000202) is write-one-to-clear on
+    /// hardware. Writes to it are intercepted in `write8` and
+    /// accumulated here instead of being stored, so the core can tell
+    /// a CPU acknowledgement apart from device-raised flags.
+    pub if_clear_mask: u16,
 }
 
 impl Bus {
     pub fn new() -> Self {
         Self {
+            bios: Box::new([0; BIOS_LEN]),
+            bios_loaded: false,
             ewram: Box::new([0; EWRAM_LEN]),
             iwram: Box::new([0; IWRAM_LEN]),
             vram: Box::new([0; VRAM_LEN]),
@@ -42,12 +53,28 @@ impl Bus {
             // 64 KiB placeholder save space. Real save-type detection
             // (SRAM / Flash / EEPROM) is Phase 3 work driven by FOMT.
             sram: alloc::vec![0xFF; 64 * 1024],
+            if_clear_mask: 0,
         }
+    }
+
+    /// Drain the accumulated IF write-to-clear mask (see field docs).
+    pub fn take_if_clear_mask(&mut self) -> u16 {
+        let m = self.if_clear_mask;
+        self.if_clear_mask = 0;
+        m
     }
 
     pub fn load_rom(&mut self, rom: &[u8]) {
         self.rom.clear();
         self.rom.extend_from_slice(rom);
+    }
+
+    /// Copy a BIOS dump (max 16 KiB) into the BIOS region. The image is
+    /// the user's own dump; the core never ships one.
+    pub fn load_bios(&mut self, bios: &[u8]) {
+        let n = bios.len().min(BIOS_LEN);
+        self.bios[..n].copy_from_slice(&bios[..n]);
+        self.bios_loaded = n > 0;
     }
 
     pub fn rom_is_empty(&self) -> bool {
@@ -74,6 +101,13 @@ impl Bus {
     fn decode(&self, addr: u32) -> Option<(&[u8], usize)> {
         let a = addr as usize;
         match addr >> 24 {
+            0x00 | 0x01 => {
+                if self.bios_loaded {
+                    Some((&*self.bios, a % BIOS_LEN))
+                } else {
+                    None
+                }
+            }
             0x02 => Some((&*self.ewram, a % EWRAM_LEN)),
             0x03 => Some((&*self.iwram, a % IWRAM_LEN)),
             0x04 => Some((&*self.io, (a & 0x3FF) % IO_LEN)),
@@ -133,6 +167,15 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, value: u8) {
+        // IF (0x04000202/3): write-one-to-clear, never stored.
+        if addr == 0x0400_0202 {
+            self.if_clear_mask |= u16::from(value);
+            return;
+        }
+        if addr == 0x0400_0203 {
+            self.if_clear_mask |= u16::from(value) << 8;
+            return;
+        }
         if let Some((region, off)) = self.decode_mut(addr) {
             if let Some(slot) = region.get_mut(off) {
                 *slot = value;
