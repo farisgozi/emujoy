@@ -13,7 +13,23 @@ documented CVEs in file parsers, versionless save states, global state,
 input-latency afterthoughts — and this design answers those problems
 from the first commit instead of patching them later.
 
-## Status: Phase 0 — foundation (skeleton)
+## Status: Phase 1 — CPU interpreter ✅ (Phase 0 foundation below)
+
+- **ARM7TDMI interpreter** (`crates/gba-core/src/cpu/`): complete ARM
+  state (data processing + barrel shifter, multiply incl. long,
+  MRS/MSR, single & halfword/signed load-store, block transfer, B/BL,
+  BX, SWP, SWI exceptions) and complete THUMB state (formats 1–19),
+  with banked registers per mode and SPSR handling.
+- **Verified by 16 program tests** (`tests/cpu_phase1.rs`): hand-built
+  ARM/THUMB programs — flag behaviour, shifter carry, unaligned load
+  rotation inputs, UMULL/SMLAL, loops, fib(10), block copy, MRS/MSR
+  round-trip, SWI mode entry, THUMB BL/BX interworking, PUSH/POP.
+  Full suite: 30 tests, zero warnings.
+- **Not yet**: external test ROMs (ARMWrestler, jsmolka gba-tests)
+  report through the PPU, so they join as acceptance in Phase 2;
+  cycle counts are approximations until Phase 4.
+
+## Phase 0 — foundation
 
 What exists and is tested:
 

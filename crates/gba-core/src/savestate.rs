@@ -100,12 +100,13 @@ pub fn save(core: &Core) -> Vec<u8> {
     w.buf.extend_from_slice(&0u16.to_le_bytes()); // flags
     w.buf.extend_from_slice(&core.bus.rom_hash().to_le_bytes());
 
-    // CPU section: 16 regs + CPSR.
+    // CPU section: 16 raw regs (R15 = next fetch address) + CPSR.
+    let (regs, cpsr) = core.cpu.snapshot_regs();
     let mut cpu = Vec::with_capacity(68);
-    for r in core.cpu.regs {
+    for r in regs {
         cpu.extend_from_slice(&r.to_le_bytes());
     }
-    cpu.extend_from_slice(&core.cpu.cpsr.to_le_bytes());
+    cpu.extend_from_slice(&cpsr.to_le_bytes());
     w.section(SECTION_CPU, &cpu);
 
     // Scheduler section: now + (at, kind-tag) per pending event.
@@ -169,10 +170,12 @@ pub fn load(core: &mut Core, data: &[u8]) -> Result<(), SaveError> {
                     return Err(SaveError::BadPayload { section: id });
                 }
                 let mut pr = Reader { data: payload, pos: 0 };
-                for reg in core.cpu.regs.iter_mut() {
+                let mut regs = [0u32; 16];
+                for reg in regs.iter_mut() {
                     *reg = pr.u32()?;
                 }
-                core.cpu.cpsr = pr.u32()?;
+                let cpsr = pr.u32()?;
+                core.cpu.restore_regs(regs, cpsr);
             }
             SECTION_SCHEDULER => {
                 let mut pr = Reader { data: payload, pos: 0 };
@@ -250,14 +253,14 @@ mod tests {
         let mut a = Core::new();
         a.load_rom(&rom).unwrap();
         a.bus.write32(0x0200_0000, 0xCAFE_BABE);
-        a.cpu.regs[3] = 42;
+        a.cpu.set_reg(3, 42);
         let blob = save(&a);
 
         let mut b = Core::new();
         b.load_rom(&rom).unwrap();
         load(&mut b, &blob).unwrap();
         assert_eq!(b.bus.read32(0x0200_0000), 0xCAFE_BABE);
-        assert_eq!(b.cpu.regs[3], 42);
+        assert_eq!(b.cpu.reg(3), 42);
     }
 
     #[test]

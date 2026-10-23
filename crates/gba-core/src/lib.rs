@@ -11,18 +11,23 @@
 //! - [`Host`]: the narrow interface the frontend implements. The core
 //!   never touches a real file, socket, thread, or clock.
 //!
-//! What does NOT exist yet: CPU execution (Phase 1), PPU/APU rendering.
-//! `Core::run_frame` advances time and fires scheduled events only.
+//! Phase 1 adds the ARM7TDMI interpreter (`cpu` module): full ARM and
+//! THUMB instruction sets with mode banking, verified by the hand-built
+//! program suite in `tests/cpu_phase1.rs`. What does NOT exist yet:
+//! PPU/APU rendering and the IRQ/timer/DMA wiring of Phase 2 — the CPU
+//! runs, but nothing draws or sounds yet.
 #![no_std]
 
 extern crate alloc;
 
 pub mod bus;
+pub mod cpu;
 pub mod host;
 pub mod savestate;
 pub mod scheduler;
 
 pub use bus::Bus;
+pub use cpu::Cpu;
 pub use host::{Host, NullHost};
 pub use scheduler::{EventKind, Scheduler};
 
@@ -38,27 +43,10 @@ pub const CYCLES_PER_FRAME: u64 = 280_896;
 /// source of judder/audio crackle on other cores.
 pub const FRAME_RATE_MILLIHZ: u32 = 59_727;
 
-/// CPU register file placeholder. Phase 1 replaces `step` with a real
-/// ARM7TDMI interpreter written from the ARM TRM; the layout (16 GPRs +
-/// CPSR) is already the real one.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CpuState {
-    pub regs: [u32; 16],
-    pub cpsr: u32,
-}
-
-impl Default for CpuState {
-    fn default() -> Self {
-        // Supervisor mode, IRQ/FIQ disabled — the state the BIOS leaves
-        // behind is Phase 2 work; this is a defined starting point.
-        Self { regs: [0; 16], cpsr: 0x0000_00D3 }
-    }
-}
-
 /// The whole machine. Owns everything by value; create as many as you
 /// like, they cannot interfere with each other.
 pub struct Core {
-    pub cpu: CpuState,
+    pub cpu: Cpu,
     pub scheduler: Scheduler,
     pub bus: Bus,
     /// Framebuffer the PPU will draw into (Phase 3). Allocated once.
@@ -70,11 +58,28 @@ pub struct Core {
 impl Core {
     pub fn new() -> Self {
         Self {
-            cpu: CpuState::default(),
+            cpu: Cpu::new(),
             scheduler: Scheduler::new(),
             bus: Bus::new(),
             framebuffer: Box::new([0; SCREEN_W * SCREEN_H]),
             frames_presented: 0,
+        }
+    }
+
+    /// Execute exactly one CPU instruction, advancing the scheduler by
+    /// its (Phase 1 approximate) cycle cost.
+    pub fn step_instruction(&mut self) -> u32 {
+        let cycles = self.cpu.step(&mut self.bus);
+        self.tick(u64::from(cycles));
+        cycles
+    }
+
+    /// Execute instructions until the scheduler has advanced at least
+    /// `cycles` — the Phase 2 boot loop will build on this.
+    pub fn run_cycles(&mut self, cycles: u64) {
+        let deadline = self.scheduler.now().saturating_add(cycles);
+        while self.scheduler.now() < deadline {
+            self.step_instruction();
         }
     }
 
