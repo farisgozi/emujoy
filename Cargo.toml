@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/gba-core",
+    "crates/emu-parser",
+    "crates/headless",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["gozi"]
+
+[profile.release]
+# Emulator cores are latency-sensitive; keep debug info for profiling
+# but let the compiler optimise aggressively.
+opt-level = 3
+debug = true

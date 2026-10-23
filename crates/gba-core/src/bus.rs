@@ -1,0 +1,195 @@
+//! GBA memory bus — Phase 0 skeleton.
+//!
+//! Address decoding follows the GBATEK memory map. Timing (waitstates,
+//! prefetch) is deliberately NOT modelled yet; Phase 2 introduces a
+//! `cycles_for(addr, width, sequential)` cost function and Phase 4 makes
+//! it precise. What Phase 0 guarantees is the shape: all memory lives in
+//! buffers owned by `Bus`, reads/writes are total functions (unmapped
+//! space returns open-bus 0 instead of panicking), and ROM is loaded
+//! through one validated entry point.
+
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+
+pub const EWRAM_LEN: usize = 256 * 1024;
+pub const IWRAM_LEN: usize = 32 * 1024;
+pub const VRAM_LEN: usize = 96 * 1024;
+pub const OAM_LEN: usize = 1024;
+pub const PALETTE_LEN: usize = 1024;
+pub const IO_LEN: usize = 0x400;
+
+pub struct Bus {
+    pub ewram: Box<[u8; EWRAM_LEN]>,
+    pub iwram: Box<[u8; IWRAM_LEN]>,
+    pub vram: Box<[u8; VRAM_LEN]>,
+    pub oam: Box<[u8; OAM_LEN]>,
+    pub palette: Box<[u8; PALETTE_LEN]>,
+    pub io: Box<[u8; IO_LEN]>,
+    rom: Vec<u8>,
+    sram: Vec<u8>,
+}
+
+impl Bus {
+    pub fn new() -> Self {
+        Self {
+            ewram: Box::new([0; EWRAM_LEN]),
+            iwram: Box::new([0; IWRAM_LEN]),
+            vram: Box::new([0; VRAM_LEN]),
+            oam: Box::new([0; OAM_LEN]),
+            palette: Box::new([0; PALETTE_LEN]),
+            io: Box::new([0; IO_LEN]),
+            rom: Vec::new(),
+            // 64 KiB placeholder save space. Real save-type detection
+            // (SRAM / Flash / EEPROM) is Phase 3 work driven by FOMT.
+            sram: alloc::vec![0xFF; 64 * 1024],
+        }
+    }
+
+    pub fn load_rom(&mut self, rom: &[u8]) {
+        self.rom.clear();
+        self.rom.extend_from_slice(rom);
+    }
+
+    pub fn rom_is_empty(&self) -> bool {
+        self.rom.is_empty()
+    }
+
+    pub fn rom_hash(&self) -> u64 {
+        // FNV-1a; stored inside save states so a state can refuse to
+        // load against a different game.
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in &self.rom {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01B3);
+        }
+        hash
+    }
+
+    pub fn save_bytes(&self) -> &[u8] {
+        &self.sram
+    }
+
+    /// Decode an address to (region slice, offset). Mirroring follows
+    /// GBATEK: EWRAM/IWRAM/VRAM/palette/OAM repeat across their windows.
+    fn decode(&self, addr: u32) -> Option<(&[u8], usize)> {
+        let a = addr as usize;
+        match addr >> 24 {
+            0x02 => Some((&*self.ewram, a % EWRAM_LEN)),
+            0x03 => Some((&*self.iwram, a % IWRAM_LEN)),
+            0x04 => Some((&*self.io, (a & 0x3FF) % IO_LEN)),
+            0x05 => Some((&*self.palette, a % PALETTE_LEN)),
+            0x06 => Some((&*self.vram, vram_offset(a))),
+            0x07 => Some((&*self.oam, a % OAM_LEN)),
+            0x08..=0x0D => {
+                if self.rom.is_empty() {
+                    None
+                } else {
+                    Some((&self.rom, (a - 0x0800_0000) % self.rom.len()))
+                }
+            }
+            0x0E..=0x0F => Some((&self.sram, (a - 0x0E00_0000) % self.sram.len())),
+            _ => None,
+        }
+    }
+
+    fn decode_mut(&mut self, addr: u32) -> Option<(&mut [u8], usize)> {
+        let a = addr as usize;
+        match addr >> 24 {
+            0x02 => Some((&mut *self.ewram, a % EWRAM_LEN)),
+            0x03 => Some((&mut *self.iwram, a % IWRAM_LEN)),
+            0x04 => Some((&mut *self.io, (a & 0x3FF) % IO_LEN)),
+            0x05 => Some((&mut *self.palette, a % PALETTE_LEN)),
+            0x06 => {
+                let off = vram_offset(a);
+                Some((&mut *self.vram, off))
+            }
+            0x07 => Some((&mut *self.oam, a % OAM_LEN)),
+            0x0E..=0x0F => {
+                let off = (a - 0x0E00_0000) % self.sram.len();
+                Some((&mut self.sram, off))
+            }
+            // ROM space is read-only through the bus.
+            _ => None,
+        }
+    }
+
+    pub fn read8(&self, addr: u32) -> u8 {
+        match self.decode(addr) {
+            Some((region, off)) => region.get(off).copied().unwrap_or(0),
+            None => 0,
+        }
+    }
+
+    pub fn read16(&self, addr: u32) -> u16 {
+        let lo = u16::from(self.read8(addr));
+        let hi = u16::from(self.read8(addr.wrapping_add(1)));
+        lo | (hi << 8)
+    }
+
+    pub fn read32(&self, addr: u32) -> u32 {
+        let lo = u32::from(self.read16(addr));
+        let hi = u32::from(self.read16(addr.wrapping_add(2)));
+        lo | (hi << 16)
+    }
+
+    pub fn write8(&mut self, addr: u32, value: u8) {
+        if let Some((region, off)) = self.decode_mut(addr) {
+            if let Some(slot) = region.get_mut(off) {
+                *slot = value;
+            }
+        }
+    }
+
+    pub fn write16(&mut self, addr: u32, value: u16) {
+        self.write8(addr, value as u8);
+        self.write8(addr.wrapping_add(1), (value >> 8) as u8);
+    }
+
+    pub fn write32(&mut self, addr: u32, value: u32) {
+        self.write16(addr, value as u16);
+        self.write16(addr.wrapping_add(2), (value >> 16) as u16);
+    }
+}
+
+impl Default for Bus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// VRAM has a quirk: the 96 KiB maps as 128 KiB with the top 32 KiB
+/// mirrored (0x06010000.. repeats 0x06018000.. style aliasing is handled
+/// by masking into the real buffer).
+fn vram_offset(addr: usize) -> usize {
+    let off = addr - 0x0600_0000;
+    let off = off % (128 * 1024);
+    if off >= VRAM_LEN {
+        off - 32 * 1024
+    } else {
+        off
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn regions_are_writable_and_mirrored() {
+        let mut bus = Bus::new();
+        bus.write32(0x0200_0100, 0xDEAD_BEEF);
+        assert_eq!(bus.read32(0x0200_0100), 0xDEAD_BEEF);
+        // EWRAM mirror: +4 MiB window start decodes to the same cell.
+        assert_eq!(bus.read32(0x0240_0100 & 0xFFFF_FFFF), 0xDEAD_BEEF);
+        bus.write16(0x0300_0020, 0xBEEF);
+        assert_eq!(bus.read16(0x0300_0020), 0xBEEF);
+    }
+
+    #[test]
+    fn unmapped_and_rom_writes_are_safe() {
+        let mut bus = Bus::new();
+        assert_eq!(bus.read8(0x0100_0000), 0); // BIOS region: Phase 0 reads 0
+        bus.write8(0x0800_0000, 0xAA); // ROM space: ignored, no panic
+        assert_eq!(bus.read8(0x0800_0000), 0);
+    }
+}

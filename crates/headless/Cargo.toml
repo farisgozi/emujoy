@@ -1,0 +1,10 @@
+[package]
+name = "headless"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Headless test harness: runs the core without a display, hashes frames, checks determinism."
+
+[dependencies]
+gba-core = { path = "../gba-core" }
+emu-parser = { path = "../emu-parser" }

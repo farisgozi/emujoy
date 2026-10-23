@@ -1,0 +1,9 @@
+[package]
+name = "gba-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Clean-room Game Boy Advance emulation core, built from scratch. no_std, no OS, no globals."
+
+[dependencies]
+emu-parser = { path = "../emu-parser" }

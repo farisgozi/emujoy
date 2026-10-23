@@ -1,0 +1,6 @@
+[package]
+name = "emu-parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hardened, fuzz-oriented parsers for emulator file formats (GBA ROM header, CUE sheet). No unsafe code."
