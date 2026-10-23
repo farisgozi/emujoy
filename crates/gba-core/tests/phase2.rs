@@ -30,8 +30,9 @@ fn strh_imm(rn: u32, rd: u32, imm: u32) -> u32 {
 const HALT: u32 = 0xEAFF_FFFE; // B .
 
 /// IRQ handler blob at HANDLER: increments the word at COUNTER_CELL,
-/// acknowledges `ack_bit` in IF via a halfword store, returns with
-/// SUBS PC, LR, #4.
+/// acknowledges `ack_bit` in IF via a halfword store, and returns
+/// with BX LR — the real BIOS-stub contract the core emulates (the
+/// stub pops the saved registers and performs SUBS PC, LR, #4).
 fn write_handler(core: &mut Core, ack_bit: u32) {
     // Note on the ack store: word stores mask their address to 4-byte
     // alignment on ARM7, so IF (0x...202) can only be acked with a
@@ -47,7 +48,7 @@ fn write_handler(core: &mut Core, ack_bit: u32) {
         dp_imm(OP_ADD, 0, 2, 2, 0, 2),                     // R2 += 2 -> 0x0400_0202
         mov_imm(3, 0, ack_bit),                            // R3 = ack mask
         strh_imm(2, 3, 0),                                 // STRH R3, [R2] (IF ack)
-        0xE25E_F004,                                       // SUBS PC, LR, #4
+        0xE12F_FF1E,                                       // BX LR (to the BIOS stub)
     ];
     for (i, w) in code.iter().enumerate() {
         core.bus.write32(HANDLER + (i as u32) * 4, *w);
@@ -137,6 +138,10 @@ fn dma3_immediate_word_copy() {
 fn mode3_bitmap_reaches_framebuffer() {
     let mut core = spinning_core();
     core.bus.write16(0x0400_0000, 0x0003 | (1 << 10)); // Mode 3 + BG2
+    // Bitmap modes are affine-transformed: identity matrix, as a
+    // real game would program it (Phase 4 renderer).
+    core.bus.write16(0x0400_0020, 0x0100); // BG2PA = 1.0
+    core.bus.write16(0x0400_0026, 0x0100); // BG2PD = 1.0
     core.bus.write16(0x0600_0000, 0x001F); // (0,0) red
     let last = (159 * 240 + 239) * 2;
     core.bus.write16(0x0600_0000 + last, 0x03E0); // (239,159) green

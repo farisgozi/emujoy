@@ -151,16 +151,18 @@ pub fn save(core: &Core) -> Vec<u8> {
     // Save-memory section (v2): chip kind tag + bank/id state + the
     // full contents, so a state captures the battery save too.
     let (bank, id_mode) = core.bus.save.state_words();
-    let mut sm = Vec::with_capacity(4 + core.bus.save.data.len());
+    let contents = &core.bus.save.data[..core.bus.save.contents_len()];
+    let mut sm = Vec::with_capacity(4 + contents.len());
     sm.push(match core.bus.save.kind {
         crate::save::SaveKind::Sram => 0,
         crate::save::SaveKind::Flash64 => 1,
         crate::save::SaveKind::Flash128 => 2,
+        crate::save::SaveKind::Eeprom => 3,
     });
     sm.push(bank);
     sm.push(id_mode as u8);
     sm.push(0);
-    sm.extend_from_slice(&core.bus.save.data);
+    sm.extend_from_slice(contents);
     w.section(SECTION_SAVEMEM, &sm);
 
     w.buf
@@ -263,16 +265,27 @@ pub fn load(core: &mut Core, data: &[u8]) -> Result<(), SaveError> {
                     0 => crate::save::SaveKind::Sram,
                     1 => crate::save::SaveKind::Flash64,
                     2 => crate::save::SaveKind::Flash128,
+                    3 => crate::save::SaveKind::Eeprom,
                     _ => return Err(SaveError::BadPayload { section: id }),
                 };
                 let contents = &payload[4..];
-                if contents.len() != kind.size() {
+                let len_ok = if kind == crate::save::SaveKind::Eeprom {
+                    contents.len() == 512 || contents.len() == 8192
+                } else {
+                    contents.len() == kind.size()
+                };
+                if !len_ok {
                     return Err(SaveError::BadPayload { section: id });
                 }
                 if core.bus.save.kind != kind {
                     core.bus.save = crate::save::SaveMemory::new(kind);
                 }
                 core.bus.save.restore_state(payload[1], payload[2] != 0, contents);
+                if kind == crate::save::SaveKind::Eeprom && contents.len() > 512 {
+                    // The 8 KiB chip: restore its wider address field
+                    // so contents_len() keeps reporting 8192.
+                    core.bus.save.eeprom.borrow_mut().addr_bits = 14;
+                }
             }
             // Unknown section: ignored by design (forward compatibility),
             // but it was still length- and CRC-checked above.

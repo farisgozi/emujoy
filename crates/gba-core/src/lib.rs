@@ -22,6 +22,7 @@
 
 extern crate alloc;
 
+pub mod apu;
 pub mod bus;
 pub mod cpu;
 pub mod dma;
@@ -68,6 +69,10 @@ const REG_IME: u32 = 0x0400_0208;
 const REG_DISPSTAT: u32 = 0x0400_0004;
 const REG_KEYINPUT: u32 = 0x0400_0130;
 const IRQ_HANDLER_PTR: u32 = 0x0300_7FFC;
+/// Sentinel "return address" for the emulated BIOS IRQ stub: an
+/// unused word near the top of BIOS space. Never executed — the
+/// core intercepts the PC before the fetch (see step_instruction).
+const BIOS_STUB_RETURN: u32 = 0x0000_03FC;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HleWait {
@@ -94,11 +99,20 @@ pub struct Core {
     /// BIOS-less HLE wait state (IntrWait / VBlankIntrWait / Halt):
     /// while set, the CPU is parked and only devices advance.
     hle_wait: Option<HleWait>,
+    /// True while a game IRQ handler runs under the emulated BIOS
+    /// stub (see `dispatch_irq`): the stub epilogue runs when the PC
+    /// reaches `BIOS_STUB_RETURN`.
+    bios_stub_active: bool,
     /// BIOS HLE is a boot policy, not a CPU behaviour: it activates
     /// when the machine is booted via `boot_cartridge`/`boot_bios`
     /// without a BIOS dump, so bare-CPU tests still see the raw SWI
     /// exception semantics.
     hle_enabled: bool,
+    /// Sound: PSG channels + Direct Sound FIFOs (Phase 4).
+    pub apu: apu::Apu,
+    /// Stereo samples produced since the last frame, pushed to the
+    /// host at present time (interleaved L,R i16 @ 32768 Hz).
+    audio_pending: alloc::vec::Vec<i16>,
 }
 
 impl Core {
@@ -115,7 +129,10 @@ impl Core {
             dma_prev_control: [0; 4],
             keys_pressed: 0,
             hle_wait: None,
+            bios_stub_active: false,
             hle_enabled: false,
+            apu: apu::Apu::new(),
+            audio_pending: alloc::vec::Vec::new(),
         };
         core.set_io16(REG_KEYINPUT, 0x03FF);
         core
@@ -142,7 +159,7 @@ impl Core {
     /// The cartridge save contents (.sav image) for the frontend to
     /// persist. Kind/size were fixed at ROM load by string detection.
     pub fn save_data(&self) -> &[u8] {
-        &self.bus.save.data
+        &self.bus.save.data[..self.bus.save.contents_len()]
     }
 
     /// Load a previously persisted .sav image into the save chip.
@@ -204,6 +221,14 @@ impl Core {
         self.cpu.set_reg(13, 0x0300_7F00);
         self.cpu.set_pc(0x0800_0000);
         self.set_keys(0);
+        // The real BIOS leaves the affine matrices at identity after
+        // its logo animation, and software relies on it — the
+        // jsmolka test suites, for instance, draw their Mode 4 text
+        // screen without ever programming BG2PA/BG2PD. A zero matrix
+        // would collapse the bitmap onto texel (0,0).
+        for reg in [0x0400_0020u32, 0x0400_0026, 0x0400_0030, 0x0400_0036] {
+            self.set_io16(reg, 0x0100);
+        }
     }
 
     /// Boot into a loaded BIOS at address 0 (it will hand off to the
@@ -241,6 +266,30 @@ impl Core {
     /// Execute exactly one CPU instruction, then advance every device
     /// by its (Phase 1 approximate) cycle cost and service interrupts.
     pub fn step_instruction(&mut self) -> u32 {
+        // Emulated BIOS stub epilogue: a game IRQ handler invoked
+        // through the stub returns to this sentinel address; pop the
+        // registers the stub pushed and resume the interrupted code
+        // (SUBS PC, LR, #4 semantics with SPSR restore).
+        if self.bios_stub_active && self.cpu.pc() == BIOS_STUB_RETURN {
+            self.bios_stub_active = false;
+            let sp = self.cpu.reg(13);
+            let vals: [u32; 6] = core::array::from_fn(|i| self.bus.read32(sp + (i as u32) * 4));
+            self.cpu.set_reg(0, vals[0]);
+            self.cpu.set_reg(1, vals[1]);
+            self.cpu.set_reg(2, vals[2]);
+            self.cpu.set_reg(3, vals[3]);
+            self.cpu.set_reg(12, vals[4]);
+            self.cpu.set_reg(13, sp.wrapping_add(24));
+            let spsr = self.cpu.spsr();
+            self.cpu.set_cpsr_full(spsr);
+            self.cpu.set_pc(vals[5].wrapping_sub(4));
+            let now = self.scheduler.now();
+            self.scheduler.advance_to(now + 3);
+            self.advance_devices(3);
+            self.set_io16(REG_IF, self.pending_irq);
+            self.dispatch_irq();
+            return 3;
+        }
         // Parked by a BIOS wait call (HLE): advance devices only.
         if let Some(wait) = self.hle_wait {
             let chunk = 64;
@@ -303,8 +352,10 @@ impl Core {
     fn advance_devices(&mut self, cycles: u64) {
         // Timers first: their overflows feed the IRQ bits below.
         let mut cascade_overflows: u32 = 0;
+        let mut timer_overflows = [0u32; 4];
         for ch in 0..4 {
             let overflows = self.tick_timer(ch, cycles, cascade_overflows);
+            timer_overflows[ch] = overflows;
             if overflows > 0 {
                 let ctrl = self.bus.read16(0x0400_0102 + (ch as u32) * 4);
                 if ctrl & (1 << 6) != 0 {
@@ -313,6 +364,7 @@ impl Core {
             }
             cascade_overflows = overflows;
         }
+        self.advance_audio(cycles, timer_overflows);
 
         // PPU timing + rendering (split borrows via replace).
         let mut ppu = core::mem::replace(&mut self.ppu, Ppu::new());
@@ -346,6 +398,81 @@ impl Core {
                 }
             }
             self.dma_prev_control[ch] = dma::latch(&self.bus, ch).control;
+        }
+    }
+
+    /// APU service: register sync, trigger delivery, FIFO clocking
+    /// from the sound timers, sound DMA refills, sample production.
+    fn advance_audio(&mut self, cycles: u64, timer_overflows: [u32; 4]) {
+        // Bytes pushed to the FIFO ports since last time.
+        for w in 0..2 {
+            let bytes = core::mem::take(&mut self.bus.fifo_in[w]);
+            if !bytes.is_empty() {
+                self.apu.push_fifo(w, &bytes);
+            }
+        }
+        // FIFO reset bits in SOUNDCNT_H are self-clearing on HW.
+        let cnth = self.bus.read16(0x0400_0082);
+        if cnth & 0x8800 != 0 {
+            if cnth & (1 << 11) != 0 {
+                self.apu.reset_fifo(0);
+            }
+            if cnth & (1 << 15) != 0 {
+                self.apu.reset_fifo(1);
+            }
+            self.bus.write16(0x0400_0082, cnth & !0x8800);
+        }
+        self.apu.sync(&self.bus.io[..]);
+        // PSG trigger edges recorded by the bus.
+        let trig = self.bus.snd_trigger_mask;
+        if trig != 0 {
+            self.bus.snd_trigger_mask = 0;
+            for ch in 0..4 {
+                if trig & (1 << ch) != 0 {
+                    self.apu.trigger(ch, &self.bus.io[..]);
+                }
+            }
+        }
+        // FIFO playback ticks: each FIFO is clocked by timer 0 or 1
+        // (SOUNDCNT_H bits 10 and 14).
+        let cnth = self.bus.read16(0x0400_0082);
+        for w in 0..2 {
+            let timer_ch = if cnth & (1 << (10 + w * 4)) != 0 { 1 } else { 0 };
+            for _ in 0..timer_overflows[timer_ch] {
+                self.apu.fifo_tick(w);
+            }
+        }
+        // Sound DMA refills (DMA1/DMA2 in Special timing with the
+        // destination on a FIFO port).
+        for w in 0..2 {
+            if !self.apu.fifo_dma_needed[w] {
+                continue;
+            }
+            let port = 0x0400_00A0 + (w as u32) * 4;
+            for ch in 1..=2usize {
+                let chan = dma::latch(&self.bus, ch);
+                if chan.enabled() && chan.timing() == dma::DmaTiming::Special && chan.dst & !3 == port {
+                    if dma::run_sound_transfer(&mut self.bus, &chan) {
+                        self.pending_irq |= 1 << (8 + ch);
+                    }
+                    // The transfer wrote into bus.fifo_in; forward.
+                    let bytes = core::mem::take(&mut self.bus.fifo_in[w]);
+                    if !bytes.is_empty() {
+                        self.apu.push_fifo(w, &bytes);
+                    }
+                    break;
+                }
+            }
+        }
+        self.apu.advance(cycles, &self.bus.io[..]);
+        if !self.apu.out.is_empty() {
+            self.audio_pending.append(&mut self.apu.out);
+        }
+        // SOUNDCNT_X status bits mirror the channel-running state.
+        let cur = self.bus.read16(0x0400_0084);
+        let want = (cur & 0xFFF0) | self.apu.status();
+        if cur != want {
+            self.bus.write16(0x0400_0084, want);
         }
     }
 
@@ -522,13 +649,37 @@ impl Core {
         if self.bus.bios_loaded {
             self.cpu.exception(cpu::MODE_IRQ, return_addr.wrapping_add(4), 0x18);
         } else {
-            // No BIOS: emulate its dispatcher contract — the game has
-            // stored its handler address at 0x03007FFC, and the handler
-            // returns with SUBS PC, LR, #4 (our exception() prepared
-            // LR and SPSR exactly as the BIOS path expects).
+            // No BIOS: reproduce the real BIOS IRQ stub, which is the
+            // contract game handlers are actually written against
+            // (FOMT's handler, for instance, silently corrupts its
+            // return flow if entered any other way): the stub pushes
+            // R0-R3, R12 and LR onto the IRQ stack, calls the handler
+            // stored at 0x03007FFC with LR pointing back into the
+            // stub, and on return pops everything and resumes with
+            // SUBS PC, LR, #4. Here the "stub" is emulated: LR is a
+            // sentinel in unused BIOS space and `step_instruction`
+            // performs the epilogue when the handler reaches it.
             let handler = self.bus.read32(IRQ_HANDLER_PTR);
-            let target = if handler != 0 { handler } else { 0x18 };
-            self.cpu.exception(cpu::MODE_IRQ, return_addr.wrapping_add(4), target);
+            if handler == 0 {
+                return; // nobody to call; the BIOS would spin here too
+            }
+            let saved = [
+                self.cpu.reg(0),
+                self.cpu.reg(1),
+                self.cpu.reg(2),
+                self.cpu.reg(3),
+                self.cpu.reg(12),
+            ];
+            self.cpu.exception(cpu::MODE_IRQ, return_addr.wrapping_add(4), handler);
+            let lr = self.cpu.reg(14);
+            let sp = self.cpu.reg(13).wrapping_sub(24);
+            for (i, v) in saved.iter().enumerate() {
+                self.bus.write32(sp + (i as u32) * 4, *v);
+            }
+            self.bus.write32(sp + 20, lr);
+            self.cpu.set_reg(13, sp);
+            self.cpu.set_reg(14, BIOS_STUB_RETURN);
+            self.bios_stub_active = true;
         }
     }
 
@@ -547,6 +698,10 @@ impl Core {
         self.frames_presented += 1;
         let keys = host.poll_input();
         self.set_keys(keys);
+        if !self.audio_pending.is_empty() {
+            let samples = core::mem::take(&mut self.audio_pending);
+            host.push_audio(&samples);
+        }
         host.present_frame(&self.framebuffer);
     }
 

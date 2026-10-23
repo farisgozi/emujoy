@@ -54,6 +54,25 @@ fn write_control(bus: &mut Bus, ch: usize, control: u16) {
     bus.write16(addr, control);
 }
 
+/// Sound FIFO refill: exactly four words (16 bytes) from source to
+/// the FIFO port, destination fixed, unit size forced to 32 bits,
+/// the channel stays enabled for the next request. Returns the IRQ
+/// flag state like a normal transfer.
+pub fn run_sound_transfer(bus: &mut Bus, chan: &DmaChannel) -> bool {
+    let src_mode = (chan.control >> 7) & 0x3;
+    let mut src = chan.src;
+    for _ in 0..4 {
+        let v = bus.read32(src & !3);
+        bus.write32(chan.dst & !3, v);
+        src = match src_mode {
+            0 => src.wrapping_add(4),
+            1 => src.wrapping_sub(4),
+            _ => src,
+        };
+    }
+    chan.control & (1 << 14) != 0
+}
+
 /// Run one transfer. Returns true when the channel's IRQ is enabled and
 /// the transfer finished (the core then raises the DMA IRQ bit).
 pub fn run_transfer(bus: &mut Bus, ch: usize, chan: &DmaChannel) -> bool {

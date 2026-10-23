@@ -13,6 +13,64 @@ documented CVEs in file parsers, versionless save states, global state,
 input-latency afterthoughts — and this design answers those problems
 from the first commit instead of patching them later.
 
+## Milestone: FOMT boots 🎉
+
+Harvest Moon: Friends of Mineral Town (user-supplied ROM) boots on
+this core: the intro plays, the title screen renders with its
+affine logo, and the title music plays. The boot blocker was the
+IRQ dispatch contract (see `docs/hardware-notes.md`, "BIOS stub").
+
+## Status: Phase 4 — full PPU (affine/windows/effects), APU, EEPROM ✅
+
+- **Affine backgrounds**: Mode 1 BG2 and Mode 2 BG2/BG3 with
+  hardware-faithful internal reference points (reloaded at frame
+  start and on register rewrite, stepped per scanline); bitmap
+  Modes 3/4/5 are sampled through the same matrix, exactly like
+  hardware. Found on the way in: the real BIOS leaves the affine
+  matrices at identity after its logo animation, and software
+  (including the jsmolka suites) relies on that leftover state —
+  `boot_cartridge()` now reproduces it.
+- **Windows & effects**: WIN0/WIN1/OBJ windows with WININ/WINOUT
+  layer masks, alpha blending, brightness up/down, semi-transparent
+  OBJ forcing alpha, mosaic (BG + OBJ), forced blank. The
+  compositor works per-pixel on (priority, layer order) with a
+  true second-layer candidate for blending — OBJ loses same-
+  priority ties to BGs, as on hardware.
+- **Objects**: affine sprites (incl. double-size), correct
+  per-pixel priority against BGs, OBJ window sprites, mosaic;
+  OBJ tile fetches in bitmap modes start at 0x14000.
+- **APU**: all four PSG channels (square ×2 — one with frequency
+  sweep — wave with banked RAM, noise with LFSR) clocked by the
+  512 Hz frame sequencer (length / sweep / envelope), plus both
+  Direct Sound FIFOs fed by sound-mode DMA (DMA1/2, special
+  timing, 16-byte refills) and clocked by timers 0/1. Stereo i16
+  at 32768 Hz reaches the host through `push_audio`; FOMT's title
+  music plays (verified via `EMU_WAV` dump analysis). Register
+  trigger edges are detected in the bus — a level poll cannot see
+  them.
+- **EEPROM saves**: the serial 1-bit protocol in the 0x0D window
+  (request frames, busy polling, 64-bit block transfers); the
+  address width (6 vs 14 bits) follows the loaded save image size,
+  mirroring the fixed-width chips.
+- **Save-state v2** grows the EEPROM kind tag; PPU affine internals
+  re-derive on load (they reload every frame anyway) and the APU
+  restarts silent until the game re-triggers its channels —
+  documented approximations, not silent gaps.
+- **Verified**: 56 tests green (incl. 6 new Phase 4 renderer tests,
+  2 APU tests, EEPROM round-trip, external-ROM integration);
+  jsmolka suites still ALL PASS;
+  FOMT title screen frame hash unchanged from the Phase 4a
+  milestone, determinism OK.
+- **Known cosmetic artifact**: FOMT's "Friends of Mineral Town"
+  subtitle band shows smeared tiles on the title screen while the
+  rest of the frame is pixel-clean — suspected mid-scanline effect
+  that the line-entry renderer approximates; under investigation,
+  not a compositor bug (attract-mode scenes render clean).
+- **Still open**: cycle-exact timing (planned as part of the
+  Phase 5 interpreter polish), frontend audio output device
+  (the core emits samples; minifb frontend doesn't play them yet),
+  more test-ROM families (ppu/sound suites).
+
 ## Status: Phase 3 — save hardware, BIOS HLE, frontend, external suites ✅
 
 - **Save hardware**: SRAM (32 KiB) and Flash 64K/128K with the full
@@ -42,10 +100,8 @@ from the first commit instead of patching them later.
   CPSR from SPSR, load writeback winning over Rd==Rn, OAM byte-store
   ignore, palette/VRAM byte duplication, GamePak mirroring, and
   empty-register-list block transfers.
-- **Still open** (Phase 4 accuracy work): APU/sound, affine BGs,
-  windows/blend/mosaic, cycle-exact timing, EEPROM saves, more
-  test-ROM families (ppu/sound suites). FOMT itself needs your own
-  ROM dump to boot-test — the core is ready for it.
+- **Still open at the time** (all landed in Phase 4): APU/sound,
+  affine BGs, windows/blend/mosaic, EEPROM saves.
 
 ## Phase 2 — minimum boot system
 

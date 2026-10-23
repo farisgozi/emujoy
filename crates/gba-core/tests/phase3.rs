@@ -166,3 +166,54 @@ fn savestate_v2_restores_timer_and_pending_irq() {
     savestate::load(&mut fresh, &blob).unwrap();
     assert_eq!(fresh.pending_irq, 0x0009);
 }
+
+// -- Phase 4c: EEPROM serial protocol --------------------------------
+
+#[test]
+fn eeprom_write_then_read_roundtrip() {
+    let mut m = gba_core::save::SaveMemory::new(gba_core::save::SaveKind::Eeprom);
+    let send = |m: &mut gba_core::save::SaveMemory, bits: &[u8]| {
+        for &b in bits {
+            m.eeprom_write_bit(b);
+        }
+    };
+    // Write frame: start(1), write(1), addr 0b000101 (5), 64 data
+    // bits (0x0123456789ABCDEF MSB-first), stop(0).
+    let mut frame = vec![1u8, 1];
+    for i in (0..6).rev() {
+        frame.push(((5 >> i) & 1) as u8);
+    }
+    let value: u64 = 0x0123_4567_89AB_CDEF;
+    for i in (0..64).rev() {
+        frame.push(((value >> i) & 1) as u8);
+    }
+    frame.push(0);
+    send(&mut m, &frame);
+    assert_eq!(&m.data[40..48], &value.to_be_bytes());
+    assert!(m.dirty);
+    // Busy while programming, then ready.
+    assert_eq!(m.eeprom_read_bit(), 0);
+    for _ in 0..1100 {
+        m.eeprom_read_bit();
+    }
+    // Read frame: start(1), read(0), addr, stop(0).
+    let mut rframe = vec![1u8, 0];
+    for i in (0..6).rev() {
+        rframe.push(((5 >> i) & 1) as u8);
+    }
+    rframe.push(0);
+    send(&mut m, &rframe);
+    // 4 dummy zero bits, then the 64 data bits MSB-first.
+    let mut got: u64 = 0;
+    for i in 0..68 {
+        let bit = m.eeprom_read_bit();
+        if i >= 4 {
+            got = (got << 1) | u64::from(bit);
+        } else {
+            assert_eq!(bit, 0, "dummy bits are 0");
+        }
+    }
+    assert_eq!(got, value);
+    // After the transfer the line idles at 1.
+    assert_eq!(m.eeprom_read_bit(), 1);
+}

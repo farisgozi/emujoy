@@ -38,6 +38,14 @@ pub struct Bus {
     /// accumulated here instead of being stored, so the core can tell
     /// a CPU acknowledgement apart from device-raised flags.
     pub if_clear_mask: u16,
+    /// Bytes written to the Direct Sound FIFO ports (0x040000A0/A4),
+    /// queued for the APU. DMA and CPU writes both land here; the
+    /// FIFO ports are write-only, so nothing is stored in `io`.
+    pub fifo_in: [alloc::vec::Vec<u8>; 2],
+    /// Bitmask of PSG channels whose trigger bit (CNT_X bit 15) was
+    /// written since the last drain — write detection for the APU,
+    /// which cannot see trigger edges by polling the register value.
+    pub snd_trigger_mask: u8,
 }
 
 impl Bus {
@@ -54,6 +62,35 @@ impl Bus {
             rom: Vec::new(),
             save: crate::save::SaveMemory::new(crate::save::SaveKind::Sram),
             if_clear_mask: 0,
+            fifo_in: [alloc::vec::Vec::new(), alloc::vec::Vec::new()],
+            snd_trigger_mask: 0,
+        }
+    }
+
+    /// Note a write to a PSG control register's high byte: CNT_X
+    /// trigger bits (bit 15 = byte bit 7 at 0x..65/6D/75/7D) are
+    /// recorded for the APU. Also queue FIFO port bytes.
+    /// Returns true when the address was fully handled here.
+    fn snd_hook(&mut self, addr: u32, value: u8) -> bool {
+        match addr {
+            0x0400_00A0..=0x0400_00A7 => {
+                let idx = if addr < 0x0400_00A4 { 0 } else { 1 };
+                self.fifo_in[idx].push(value);
+                true
+            }
+            0x0400_0065 | 0x0400_006D | 0x0400_0075 | 0x0400_007D => {
+                if value & 0x80 != 0 {
+                    let bit = match addr {
+                        0x0400_0065 => 0,
+                        0x0400_006D => 1,
+                        0x0400_0075 => 2,
+                        _ => 3,
+                    };
+                    self.snd_trigger_mask |= 1 << bit;
+                }
+                false
+            }
+            _ => false,
         }
     }
 
@@ -154,9 +191,18 @@ impl Bus {
         }
     }
 
+    /// EEPROM carts expose their chip in the 0x0D window (serial
+    /// protocol, one bit per access, upper bits read back as 1s).
+    fn in_eeprom_window(&self, addr: u32) -> bool {
+        self.save.kind == crate::save::SaveKind::Eeprom && addr >> 24 == 0x0D
+    }
+
     pub fn read8(&self, addr: u32) -> u8 {
         if matches!(addr >> 24, 0x0E..=0x0F) {
             return self.save.read(addr);
+        }
+        if self.in_eeprom_window(addr) {
+            return 0xFE | self.save.eeprom_read_bit();
         }
         match self.decode(addr) {
             Some((region, off)) => region.get(off).copied().unwrap_or(0),
@@ -165,6 +211,10 @@ impl Bus {
     }
 
     pub fn read16(&self, addr: u32) -> u16 {
+        if self.in_eeprom_window(addr) {
+            // One bit per bus access, whatever the width.
+            return 0xFFFE | u16::from(self.save.eeprom_read_bit());
+        }
         if matches!(addr >> 24, 0x0E..=0x0F) {
             // Byte-wide chip on a 16-bit bus: the byte repeats.
             let b = u16::from(self.save.read(addr));
@@ -176,6 +226,9 @@ impl Bus {
     }
 
     pub fn read32(&self, addr: u32) -> u32 {
+        if self.in_eeprom_window(addr) {
+            return 0xFFFF_FFFE | u32::from(self.save.eeprom_read_bit());
+        }
         if matches!(addr >> 24, 0x0E..=0x0F) {
             let b = u32::from(self.save.read(addr));
             return b * 0x0101_0101;
@@ -186,6 +239,9 @@ impl Bus {
     }
 
     pub fn write8(&mut self, addr: u32, value: u8) {
+        if self.snd_hook(addr, value) {
+            return;
+        }
         // IF (0x04000202/3): write-one-to-clear, never stored.
         if addr == 0x0400_0202 {
             self.if_clear_mask |= u16::from(value);
@@ -222,6 +278,10 @@ impl Bus {
             self.save.write(addr, value);
             return;
         }
+        if self.in_eeprom_window(addr) {
+            self.save.eeprom_write_bit(value & 1);
+            return;
+        }
         if let Some((region, off)) = self.decode_mut(addr) {
             if let Some(slot) = region.get_mut(off) {
                 *slot = value;
@@ -233,6 +293,9 @@ impl Bus {
     /// 16/32-bit stores decompose into (a palette STR must not act
     /// like two palette byte-stores).
     fn write8_raw(&mut self, addr: u32, value: u8) {
+        if self.snd_hook(addr, value) {
+            return;
+        }
         if addr == 0x0400_0202 {
             self.if_clear_mask |= u16::from(value);
             return;
@@ -253,6 +316,11 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, value: u16) {
+        if self.in_eeprom_window(addr) {
+            // One bit per bus access, whatever the width.
+            self.save.eeprom_write_bit((value & 1) as u8);
+            return;
+        }
         // NOTE: the IF intercept and save region live in write8_raw /
         // the branch below; byte-store video rules do NOT apply here.
         if matches!(addr >> 24, 0x0E..=0x0F) {
@@ -275,6 +343,10 @@ impl Bus {
     }
 
     pub fn write32(&mut self, addr: u32, value: u32) {
+        if self.in_eeprom_window(addr) {
+            self.save.eeprom_write_bit((value & 1) as u8);
+            return;
+        }
         if matches!(addr >> 24, 0x0E..=0x0F) {
             // Byte-wide chip: the byte written is selected by the
             // unaligned address bits (jsmolka flash test 008 stores a

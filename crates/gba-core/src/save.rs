@@ -7,8 +7,13 @@
 //!   GBATEK — unlock sequence (0xAA@0x5555, 0x55@0x2AAA), program byte
 //!   (bits can only be cleared; erase restores 0xFF), chip/sector
 //!   erase, ID mode, and 128 KiB bank switching.
-//! - EEPROM is deliberately not here: FOMT does not use it; it lands
-//!   when a target game needs it.
+//! - **EEPROM** (512 B / 8 KiB): the serial 1-bit protocol in the
+//!   0x0D000000 window — request frames (start bit, read/write bit,
+//!   fixed-width address, data), busy polling, and 64-bit block
+//!   transfers. The address width is a fixed chip property (6 or 14
+//!   bits); it cannot be parsed out of the bit stream (a 0 address
+//!   bit is indistinguishable from the stop bit), so it follows the
+//!   size of the loaded save image.
 //!
 //! All accesses are byte-wide, like the hardware: the bus special-cases
 //! the 0x0E000000 region so 16/32-bit accesses collapse to the single
@@ -24,6 +29,7 @@ pub enum SaveKind {
     Sram,
     Flash64,
     Flash128,
+    Eeprom,
 }
 
 impl SaveKind {
@@ -32,20 +38,23 @@ impl SaveKind {
             SaveKind::Sram => 32 * 1024,
             SaveKind::Flash64 => 64 * 1024,
             SaveKind::Flash128 => 128 * 1024,
+            // Backing buffer is the largest chip; the used capacity
+            // follows the learned address width (see contents_len).
+            SaveKind::Eeprom => 8 * 1024,
         }
     }
     fn maker_id(self) -> u8 {
         match self {
-            // Macronix for flash; SRAM has no ID protocol.
+            // Macronix for flash; SRAM/EEPROM have no ID protocol.
             SaveKind::Flash64 | SaveKind::Flash128 => 0xC2,
-            SaveKind::Sram => 0,
+            SaveKind::Sram | SaveKind::Eeprom => 0,
         }
     }
     fn device_id(self) -> u8 {
         match self {
             SaveKind::Flash64 => 0x1C,  // MX29L512-class
             SaveKind::Flash128 => 0x09, // MX29L010-class
-            SaveKind::Sram => 0,
+            SaveKind::Sram | SaveKind::Eeprom => 0,
         }
     }
 }
@@ -59,9 +68,11 @@ pub fn detect_kind(rom: &[u8]) -> SaveKind {
         SaveKind::Flash128
     } else if find(b"FLASH512_V") || find(b"FLASH_V") {
         SaveKind::Flash64
+    } else if find(b"EEPROM_V") {
+        SaveKind::Eeprom
     } else {
-        // SRAM_V, EEPROM_V (unimplemented), or no string: fall back to
-        // SRAM, the most permissive behaviour.
+        // SRAM_V or no string: fall back to SRAM, the most permissive
+        // behaviour.
         SaveKind::Sram
     }
 }
@@ -78,6 +89,54 @@ enum FlashSeq {
     BankSwitch,   // next write to 0x0000 selects the bank
 }
 
+/// Serial EEPROM protocol state (see the module docs).
+#[derive(Debug, Clone)]
+pub struct EepromProto {
+    /// Address width in bits — a fixed property of the chip: 6 on
+    /// the 512-byte (4 Kbit) part, 14 on the 8 KiB (64 Kbit) part.
+    /// The core cannot see the width in the protocol stream (a 0
+    /// address bit looks exactly like the stop bit), so it follows
+    /// the loaded save image: >512 bytes means the big chip.
+    pub addr_bits: u8,
+    state: EState,
+    addr: u32,
+    addr_count: u8,
+    data: [u8; 8],
+    data_count: u8,
+    out_addr: u32,
+    out_pos: u8,
+    out_active: bool,
+    busy_reads: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EState {
+    Start,
+    Command,
+    ReadAddr,
+    ReadStop,
+    WriteAddr,
+    WriteData,
+    WriteStop,
+}
+
+impl Default for EepromProto {
+    fn default() -> Self {
+        Self {
+            addr_bits: 6,
+            state: EState::Start,
+            addr: 0,
+            addr_count: 0,
+            data: [0; 8],
+            data_count: 0,
+            out_addr: 0,
+            out_pos: 0,
+            out_active: false,
+            busy_reads: 0,
+        }
+    }
+}
+
 pub struct SaveMemory {
     pub kind: SaveKind,
     pub data: Vec<u8>,
@@ -85,6 +144,9 @@ pub struct SaveMemory {
     seq: FlashSeq,
     id_mode: bool,
     bank: u8,
+    /// RefCell so the bus's read path (&self) can advance the serial
+    /// output state — every EEPROM read consumes a bit.
+    pub eeprom: core::cell::RefCell<EepromProto>,
 }
 
 impl SaveMemory {
@@ -96,13 +158,126 @@ impl SaveMemory {
             seq: FlashSeq::Ready,
             id_mode: false,
             bank: 0,
+            eeprom: core::cell::RefCell::new(EepromProto::default()),
         }
+    }
+
+    /// Length of the meaningful save contents (EEPROM chips expose
+    /// only the capacity their address width reaches).
+    pub fn contents_len(&self) -> usize {
+        match self.kind {
+            SaveKind::Eeprom => ((1usize << self.eeprom.borrow().addr_bits) * 8).min(self.data.len()),
+            _ => self.data.len(),
+        }
+    }
+
+    // -- EEPROM serial protocol -------------------------------------
+
+    /// Feed one bit (bit 0 of a write to the 0x0D window).
+    pub fn eeprom_write_bit(&mut self, bit: u8) {
+        let bit = bit & 1;
+        let mut guard = self.eeprom.borrow_mut();
+        let e = &mut *guard;
+        match e.state {
+            EState::Start => {
+                if bit == 1 {
+                    e.state = EState::Command;
+                    e.out_active = false;
+                }
+            }
+            EState::Command => {
+                e.addr = 0;
+                e.addr_count = 0;
+                e.state = if bit == 1 { EState::WriteAddr } else { EState::ReadAddr };
+            }
+            EState::ReadAddr => {
+                e.addr = (e.addr << 1) | u32::from(bit);
+                e.addr_count += 1;
+                if e.addr_count >= e.addr_bits {
+                    e.state = EState::ReadStop;
+                }
+            }
+            EState::ReadStop => {
+                // One stop bit (value ignored), then the chip starts
+                // driving the output on subsequent reads.
+                e.out_addr = e.addr;
+                e.out_pos = 0;
+                e.out_active = true;
+                e.state = EState::Start;
+            }
+            EState::WriteAddr => {
+                e.addr = (e.addr << 1) | u32::from(bit);
+                e.addr_count += 1;
+                if e.addr_count >= e.addr_bits {
+                    e.data = [0; 8];
+                    e.data_count = 0;
+                    e.state = EState::WriteData;
+                }
+            }
+            EState::WriteData => {
+                let idx = (e.data_count / 8) as usize;
+                e.data[idx] = (e.data[idx] << 1) | bit;
+                e.data_count += 1;
+                if e.data_count >= 64 {
+                    e.state = EState::WriteStop;
+                }
+            }
+            EState::WriteStop => {
+                if bit == 0 {
+                    // (Computed from addr_bits directly: contents_len
+                    // would re-borrow the RefCell we already hold.)
+                    let cap = ((1usize << e.addr_bits) * 8).min(self.data.len());
+                    let blocks = ((cap / 8).max(1)) as u32;
+                    let off = ((e.addr % blocks) * 8) as usize;
+                    if self.data[off..off + 8] != e.data {
+                        self.data[off..off + 8].copy_from_slice(&e.data);
+                        self.dirty = true;
+                    }
+                    e.busy_reads = 1000; // programming time, polled by games
+                }
+                e.state = EState::Start;
+            }
+        }
+    }
+
+    /// Read one bit from the 0x0D window: the busy flag (0 = busy,
+    /// 1 = ready) or the next output bit of a read transfer.
+    pub fn eeprom_read_bit(&self) -> u8 {
+        let mut guard = self.eeprom.borrow_mut();
+        let e = &mut *guard;
+        if e.busy_reads > 0 {
+            e.busy_reads -= 1;
+            return 0;
+        }
+        if !e.out_active {
+            return 1;
+        }
+        let pos = e.out_pos;
+        e.out_pos += 1;
+        if pos < 4 {
+            return 0; // dummy bits before the data
+        }
+        let bitpos = pos - 4;
+        if bitpos >= 64 {
+            e.out_active = false;
+            return 1;
+        }
+        let cap = ((1usize << e.addr_bits) * 8).min(self.data.len());
+        let blocks = ((cap / 8).max(1)) as u32;
+        let off = ((e.out_addr % blocks) * 8) as usize;
+        let byte = self.data[off + (bitpos / 8) as usize];
+        (byte >> (7 - (bitpos % 8))) & 1
     }
 
     pub fn load_contents(&mut self, bytes: &[u8]) {
         let n = bytes.len().min(self.data.len());
         self.data[..n].copy_from_slice(&bytes[..n]);
         self.dirty = false;
+        if self.kind == SaveKind::Eeprom && bytes.len() > 512 {
+            // A full-size image means the 8 KiB chip (14-bit
+            // addresses in its protocol).
+            self.eeprom.borrow_mut().addr_bits = 14;
+        }
     }
 
     fn window(&self, addr: u32) -> usize {
@@ -111,6 +286,7 @@ impl SaveMemory {
             SaveKind::Sram => (addr as usize) & 0x7FFF,
             SaveKind::Flash64 => off,
             SaveKind::Flash128 => usize::from(self.bank) * 0x10000 + off,
+            SaveKind::Eeprom => 0, // serial protocol; never indexed
         }
     }
 
@@ -135,6 +311,7 @@ impl SaveMemory {
                 }
             }
             SaveKind::Flash64 | SaveKind::Flash128 => self.flash_write(addr & 0xFFFF, value),
+            SaveKind::Eeprom => {} // the 0x0E window is inert for EEPROM carts
         }
     }
 

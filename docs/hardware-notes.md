@@ -12,6 +12,37 @@ Template:
 - Test: (test ROM / unit test name that fails if this regresses)
 - Notes: (edge cases, disagreements between sources)
 
+## PPU/APU/saves — Phase 4 field notes
+
+- **BIOS leaves identity affine matrices.** After its logo
+  animation, the real BIOS hands off with BG2PA=BG2PD=BG3PA=
+  BG3PD=0x100. Software relies on it: the jsmolka suites draw
+  their Mode 4 results screen without ever programming the
+  matrix, and a zero matrix collapses the bitmap onto texel
+  (0,0) — an all-white screen that looks like a renderer bug
+  but is a boot-state bug. `boot_cartridge()` reproduces the
+  leftover state. Modes 3/4/5 really are matrix-sampled on
+  hardware (mGBA agrees); there is no 1:1 shortcut.
+- **OBJ VRAM byte stores are ignored** — the Phase 3 bus rule
+  bit a Phase 4 unit test that filled sprite tiles with STRB.
+  Hardware behaviour; fill OBJ tiles with halfword stores.
+- **Sound trigger bits are edges, not levels.** Games rewrite
+  CNT_X with the trigger bit set for every note; polling the
+  register can never see the second note. The bus records
+  trigger writes (high byte of CNT_X, only when bit 7 of the
+  written byte is set) into a mask the core drains, mirroring
+  the IF write-to-clear intercept.
+- **EEPROM address width is not in the bit stream.** A 0
+  address bit is indistinguishable from the stop bit, so the
+  width (6 bits / 512 B, 14 bits / 8 KiB) is a fixed chip
+  property; the core takes it from the loaded save image size,
+  which is also how a real cart's fixed chip behaves from the
+  game's point of view.
+- **Sound DMA register geometry**: CNT_L/CNT_H for DMA1 live at
+  0x040000C4/0xC6 (12-byte channel stride from 0xB0). A Phase 4
+  test first wrote CNT_H at 0xCA — that's DMA2's SAD high half —
+  and the FIFO stayed silent with everything else correct.
+
 ## CPU — pipeline-visible PC (Phase 1)
 - Behaviour: reading R15 during execution yields instruction address
   +8 (ARM) / +4 (THUMB), aligned down to 2 in THUMB for PC-relative
@@ -30,6 +61,18 @@ Template:
   the old CPSR to SPSR_svc, clears T, sets I, jumps to 0x08.
 - Source: ARM7TDMI TRM (programmer's model, exception entry).
 - Test: `arm_swi_enters_supervisor_with_spsr`, `two_instances_are_independent`.
+
+## IRQ dispatch — the BIOS stub contract (found booting FOMT)
+When no BIOS dump is loaded, jumping straight to the handler at
+0x03007FFC with the raw exception LR corrupts real games: handlers
+are written against the *BIOS stub*, which pushes R0-R3, R12, LR on
+the IRQ stack, calls the handler with LR pointing back into the
+stub, then pops everything and does SUBS PC, LR, #4. FOMT's
+handler under the naive contract returned to the interrupted PC in
+the wrong state and executed THUMB code as ARM (undefined-exception
+slide into unmapped space). The core now emulates the stub: push,
+sentinel LR (0x0000_03FC, intercepted before fetch), epilogue pops
+and restores CPSR from SPSR.
 
 ## CPU — the jsmolka quirk harvest (Phase 3)
 Each of these was found by a numbered jsmolka/gba-tests failure and

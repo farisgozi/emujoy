@@ -10,7 +10,44 @@
 //! part — determinism: two runs from identical state must produce
 //! identical frame hashes.
 
-use gba_core::{Core, NullHost};
+use gba_core::{Core, Host, NullHost};
+
+/// Host that records the audio stream for EMU_WAV dumps.
+#[derive(Default)]
+struct WavHost {
+    frames: u64,
+    samples: Vec<i16>,
+}
+
+impl Host for WavHost {
+    fn present_frame(&mut self, _frame: &[u32; 240 * 160]) {
+        self.frames += 1;
+    }
+    fn push_audio(&mut self, samples: &[i16]) {
+        self.samples.extend_from_slice(samples);
+    }
+}
+
+fn write_wav(path: &str, samples: &[i16]) {
+    let n = samples.len() as u32;
+    let mut out = Vec::with_capacity(44 + samples.len() * 2);
+    out.extend_from_slice(b"RIFF");
+    out.extend_from_slice(&(36 + n * 2).to_le_bytes());
+    out.extend_from_slice(b"WAVEfmt ");
+    out.extend_from_slice(&16u32.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    out.extend_from_slice(&2u16.to_le_bytes()); // stereo
+    out.extend_from_slice(&32768u32.to_le_bytes()); // sample rate
+    out.extend_from_slice(&(32768u32 * 4).to_le_bytes());
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes());
+    out.extend_from_slice(b"data");
+    out.extend_from_slice(&(n * 2).to_le_bytes());
+    for s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    std::fs::write(path, out).expect("write wav");
+}
 
 fn synthetic_rom() -> Vec<u8> {
     let mut rom = vec![0u8; 0x200];
@@ -73,6 +110,23 @@ fn main() {
         .nth(2)
         .and_then(|s| s.parse().ok())
         .unwrap_or(60);
+    if let Ok(wav_path) = std::env::var("EMU_WAV") {
+        let mut core = Core::new();
+        core.load_rom(&rom).expect("wav load");
+        if execute {
+            core.boot_cartridge();
+        }
+        let mut host = WavHost::default();
+        for _ in 0..frames {
+            core.run_frame_cpu(&mut host);
+        }
+        let peak = host.samples.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        let nonzero = host.samples.iter().filter(|&&s| s != 0).count();
+        println!("audio: {} samples, peak {peak}, nonzero {nonzero}", host.samples.len());
+        write_wav(&wav_path, &host.samples);
+        println!("wav written to {wav_path}");
+        return;
+    }
     let (frames_a, hash_a) = run_once(&rom, frames, execute);
     let (frames_b, hash_b) = run_once(&rom, frames, execute);
 
@@ -87,6 +141,24 @@ fn main() {
 
     // Optional: dump the final frame of a fresh run as a binary PPM
     // (EMU_DUMP_FRAME=out.ppm) for visual inspection of test ROMs.
+    if std::env::var("EMU_PROBE").is_ok() {
+        let mut core = Core::new();
+        core.load_rom(&rom).expect("probe load");
+        if execute {
+            core.boot_cartridge();
+        }
+        let mut host = NullHost::default();
+        for _ in 0..frames {
+            core.run_frame_cpu(&mut host);
+        }
+        println!("probe: dispcnt={:#06x} bg2pa={:#x} bg2pb={:#x} bg2pc={:#x} bg2pd={:#x} bg2x={:#x} bg2y={:#x} bg2cnt={:#06x} pal0={:#06x} pal1={:#06x}",
+            core.bus.read16(0x0400_0000), core.bus.read16(0x0400_0020), core.bus.read16(0x0400_0022),
+            core.bus.read16(0x0400_0024), core.bus.read16(0x0400_0026),
+            core.bus.read32(0x0400_0028), core.bus.read32(0x0400_002c),
+            core.bus.read16(0x0400_000c),
+            u16::from_le_bytes([core.bus.palette[0], core.bus.palette[1]]),
+            u16::from_le_bytes([core.bus.palette[2], core.bus.palette[3]]));
+    }
     if let Ok(out) = std::env::var("EMU_DUMP_FRAME") {
         let mut core = Core::new();
         core.load_rom(&rom).expect("reload for dump");
@@ -141,7 +213,24 @@ fn trace(rom: &[u8]) {
         let instr_word = core.bus.read32(prev_pc & !3);
         history.push_back((i, prev_pc, instr_word, core.cpu.reg(13)));
         if history.len() > 48 { history.pop_front(); }
+        let prev_mode = core.cpu.mode();
         core.step_instruction();
+        if std::env::var("EMU_TRACE_IRQ").is_ok() && prev_mode != 0x12 && core.cpu.mode() == 0x12 {
+            println!("IRQ ENTRY at step {i}: interrupted pc={prev_pc:#010x} thumb={} lr_irq={:#010x} spsr={:#010x}",
+                prev_pc & 1 == 1 || core.cpu.cpsr() & 0x20 != 0, core.cpu.reg(14), core.cpu.spsr());
+            if i > 460_000 {
+                for (si, sp_pc, iw, sp) in &history {
+                    println!("  hist step {si}: pc={sp_pc:#010x} instr={iw:#010x} sp={sp:#010x}");
+                }
+            }
+        }
+        if std::env::var("EMU_TRACE_UND").is_ok() && prev_mode != 0x1B && core.cpu.mode() == 0x1B {
+            println!("UNDEFINED EXCEPTION at step {i}: faulting pc={prev_pc:#010x} instr={instr_word:#010x} thumb={}", prev_pc & 1 == 1 || core.cpu.cpsr() & 0x20 != 0);
+            for (si, sp_pc, iw, sp) in &history {
+                println!("  hist step {si}: pc={sp_pc:#010x} instr={iw:#010x} sp={sp:#010x}");
+            }
+            break;
+        }
         let pc = core.cpu.pc();
         if prev_pc == 0x0800_1d70 {
             println!("EVAL REACHED at step {i}: r12={} mode={:#x} sp={:#010x}", core.cpu.reg(12), core.cpu.mode(), core.cpu.reg(13));
