@@ -13,7 +13,41 @@ documented CVEs in file parsers, versionless save states, global state,
 input-latency afterthoughts — and this design answers those problems
 from the first commit instead of patching them later.
 
-## Status: Phase 2 — minimum boot system ✅
+## Status: Phase 3 — save hardware, BIOS HLE, frontend, external suites ✅
+
+- **Save hardware**: SRAM (32 KiB) and Flash 64K/128K with the full
+  command state machine (unlock sequence, AND-semantics programming,
+  chip/sector erase, ID mode, 128K bank switching), selected by the
+  ROM's embedded save-type string. Byte-wide bus rules are exact:
+  halfword/word stores to the save region land the single byte the
+  chip would see, selected by the unaligned address bits.
+- **Save-state format v2**: adds DEVICES (pending IRQ, timer
+  counters/reloads, PPU timing) and SAVEMEM (chip kind, bank, full
+  contents) sections. The loader still accepts v1 files.
+- **BIOS HLE** (when no BIOS dump is loaded, activated at cartridge
+  boot): SoftReset, RegisterRamReset, Halt/IntrWait/VBlankIntrWait
+  (CPU genuinely parks while devices advance), Div, Sqrt, CpuSet,
+  CpuFastSet, LZ77 decompression. With a user BIOS dump, the real
+  BIOS runs instead.
+- **Linux frontend** (`crates/frontend`, minifb): window at 4x scale,
+  keyboard → GBA keys, `.sav` loaded at boot and rewritten whenever
+  the game saves. `emu-frontend <game.gba> [save.sav]`.
+- **External acceptance — jsmolka/gba-tests: ALL FIVE SUITES PASS**
+  (arm ≈550 tests, thumb, memory, flash64, flash128; see
+  `tests-roms/`). Getting there flushed out a dozen real CPU/bus
+  quirks, each now covered and written up in
+  `docs/hardware-notes.md`: MSR-immediate decode, user-bank
+  save/restore across FIQ round trips, ROR-by-zero carry, PC reads
+  at +12 for register shifts and STR/STM, CMP-with-Rd=15 restoring
+  CPSR from SPSR, load writeback winning over Rd==Rn, OAM byte-store
+  ignore, palette/VRAM byte duplication, GamePak mirroring, and
+  empty-register-list block transfers.
+- **Still open** (Phase 4 accuracy work): APU/sound, affine BGs,
+  windows/blend/mosaic, cycle-exact timing, EEPROM saves, more
+  test-ROM families (ppu/sound suites). FOMT itself needs your own
+  ROM dump to boot-test — the core is ready for it.
+
+## Phase 2 — minimum boot system
 
 - **Timers 0–3** with prescalers, cascade, reload-on-enable, overflow
   IRQs. **IRQ path end-to-end**: device → IF (write-one-to-clear,

@@ -30,7 +30,9 @@ pub struct Bus {
     pub palette: Box<[u8; PALETTE_LEN]>,
     pub io: Box<[u8; IO_LEN]>,
     rom: Vec<u8>,
-    sram: Vec<u8>,
+    /// Cartridge save hardware (SRAM / Flash). Region 0x0E accesses are
+    /// routed to the chip model, never to a plain buffer.
+    pub save: crate::save::SaveMemory,
     /// Interrupt Flag register (0x04000202) is write-one-to-clear on
     /// hardware. Writes to it are intercepted in `write8` and
     /// accumulated here instead of being stored, so the core can tell
@@ -50,9 +52,7 @@ impl Bus {
             palette: Box::new([0; PALETTE_LEN]),
             io: Box::new([0; IO_LEN]),
             rom: Vec::new(),
-            // 64 KiB placeholder save space. Real save-type detection
-            // (SRAM / Flash / EEPROM) is Phase 3 work driven by FOMT.
-            sram: alloc::vec![0xFF; 64 * 1024],
+            save: crate::save::SaveMemory::new(crate::save::SaveKind::Sram),
             if_clear_mask: 0,
         }
     }
@@ -67,6 +67,12 @@ impl Bus {
     pub fn load_rom(&mut self, rom: &[u8]) {
         self.rom.clear();
         self.rom.extend_from_slice(rom);
+        // Save chip is chosen by the ROM's embedded save-type string.
+        // Existing contents survive a same-kind re-detect.
+        let kind = crate::save::detect_kind(rom);
+        if kind != self.save.kind {
+            self.save = crate::save::SaveMemory::new(kind);
+        }
     }
 
     /// Copy a BIOS dump (max 16 KiB) into the BIOS region. The image is
@@ -93,7 +99,7 @@ impl Bus {
     }
 
     pub fn save_bytes(&self) -> &[u8] {
-        &self.sram
+        &self.save.data
     }
 
     /// Decode an address to (region slice, offset). Mirroring follows
@@ -118,10 +124,15 @@ impl Bus {
                 if self.rom.is_empty() {
                     None
                 } else {
-                    Some((&self.rom, (a - 0x0800_0000) % self.rom.len()))
+                    // The whole 32 MiB GamePak window mirrors the ROM
+                    // (jsmolka memory test 007 reads data through the
+                    // 0x0A000000 mirror), so decode by window offset,
+                    // not by region base.
+                    Some((&self.rom, (a & 0x01FF_FFFF) % self.rom.len()))
                 }
             }
-            0x0E..=0x0F => Some((&self.sram, (a - 0x0E00_0000) % self.sram.len())),
+            // 0x0E (save region) is served by the chip model in
+            // read8/write8, not by a slice.
             _ => None,
         }
     }
@@ -138,16 +149,15 @@ impl Bus {
                 Some((&mut *self.vram, off))
             }
             0x07 => Some((&mut *self.oam, a % OAM_LEN)),
-            0x0E..=0x0F => {
-                let off = (a - 0x0E00_0000) % self.sram.len();
-                Some((&mut self.sram, off))
-            }
-            // ROM space is read-only through the bus.
+            // ROM space and the save region are not slice-writable.
             _ => None,
         }
     }
 
     pub fn read8(&self, addr: u32) -> u8 {
+        if matches!(addr >> 24, 0x0E..=0x0F) {
+            return self.save.read(addr);
+        }
         match self.decode(addr) {
             Some((region, off)) => region.get(off).copied().unwrap_or(0),
             None => 0,
@@ -155,12 +165,21 @@ impl Bus {
     }
 
     pub fn read16(&self, addr: u32) -> u16 {
+        if matches!(addr >> 24, 0x0E..=0x0F) {
+            // Byte-wide chip on a 16-bit bus: the byte repeats.
+            let b = u16::from(self.save.read(addr));
+            return b | (b << 8);
+        }
         let lo = u16::from(self.read8(addr));
         let hi = u16::from(self.read8(addr.wrapping_add(1)));
         lo | (hi << 8)
     }
 
     pub fn read32(&self, addr: u32) -> u32 {
+        if matches!(addr >> 24, 0x0E..=0x0F) {
+            let b = u32::from(self.save.read(addr));
+            return b * 0x0101_0101;
+        }
         let lo = u32::from(self.read16(addr));
         let hi = u32::from(self.read16(addr.wrapping_add(2)));
         lo | (hi << 16)
@@ -176,6 +195,56 @@ impl Bus {
             self.if_clear_mask |= u16::from(value) << 8;
             return;
         }
+        // Video memory byte-write rules (GBATEK; jsmolka memory
+        // video_strb tests): OAM ignores byte stores entirely;
+        // palette and BG VRAM duplicate the byte into both halves of
+        // the addressed halfword; OBJ VRAM ignores byte stores.
+        match addr >> 24 {
+            0x07 => return,
+            0x05 => {
+                let off = (addr as usize & 0x3FE) % PALETTE_LEN;
+                self.palette[off] = value;
+                self.palette[off + 1] = value;
+                return;
+            }
+            0x06 => {
+                let off = vram_offset(addr as usize);
+                if off < 0x1_0000 {
+                    let aligned = off & !1;
+                    self.vram[aligned] = value;
+                    self.vram[aligned + 1] = value;
+                }
+                return;
+            }
+            _ => {}
+        }
+        if matches!(addr >> 24, 0x0E..=0x0F) {
+            self.save.write(addr, value);
+            return;
+        }
+        if let Some((region, off)) = self.decode_mut(addr) {
+            if let Some(slot) = region.get_mut(off) {
+                *slot = value;
+            }
+        }
+    }
+
+    /// Raw byte store with NO special-region semantics — the path
+    /// 16/32-bit stores decompose into (a palette STR must not act
+    /// like two palette byte-stores).
+    fn write8_raw(&mut self, addr: u32, value: u8) {
+        if addr == 0x0400_0202 {
+            self.if_clear_mask |= u16::from(value);
+            return;
+        }
+        if addr == 0x0400_0203 {
+            self.if_clear_mask |= u16::from(value) << 8;
+            return;
+        }
+        if matches!(addr >> 24, 0x0E..=0x0F) {
+            self.save.write(addr, value);
+            return;
+        }
         if let Some((region, off)) = self.decode_mut(addr) {
             if let Some(slot) = region.get_mut(off) {
                 *slot = value;
@@ -184,13 +253,42 @@ impl Bus {
     }
 
     pub fn write16(&mut self, addr: u32, value: u16) {
-        self.write8(addr, value as u8);
-        self.write8(addr.wrapping_add(1), (value >> 8) as u8);
+        // NOTE: the IF intercept and save region live in write8_raw /
+        // the branch below; byte-store video rules do NOT apply here.
+        if matches!(addr >> 24, 0x0E..=0x0F) {
+            // The save chip is byte-wide on a 16-bit bus: a halfword
+            // store lands exactly one byte — the low byte at even
+            // addresses, the high byte at odd ones (GBATEK; jsmolka
+            // flash test 006 stores 0xAABB at +0 and +1 and reads
+            // back 0xBB then 0xAA).
+            let byte = if addr & 1 == 0 { value as u8 } else { (value >> 8) as u8 };
+            self.save.write(addr, byte);
+            return;
+        }
+        // Halfword accesses ignore address bit 0 outside the
+        // byte-wide save region (ARM7 behaviour; jsmolka arm test
+        // 407 stores a halfword at an odd EWRAM address and reads it
+        // back from the aligned address).
+        let a = addr & !1;
+        self.write8_raw(a, value as u8);
+        self.write8_raw(a.wrapping_add(1), (value >> 8) as u8);
     }
 
     pub fn write32(&mut self, addr: u32, value: u32) {
-        self.write16(addr, value as u16);
-        self.write16(addr.wrapping_add(2), (value >> 16) as u16);
+        if matches!(addr >> 24, 0x0E..=0x0F) {
+            // Byte-wide chip: the byte written is selected by the
+            // unaligned address bits (jsmolka flash test 008 stores a
+            // word at +0..+3 and reads back DD CC BB AA).
+            let shift = (addr & 3) * 8;
+            self.save.write(addr, (value >> shift) as u8);
+            return;
+        }
+        // Word stores align their address down on ARM7; doing it here
+        // (not in the CPU) lets the save region above see the
+        // original unaligned address.
+        let a = addr & !3;
+        self.write16(a, value as u16);
+        self.write16(a.wrapping_add(2), (value >> 16) as u16);
     }
 }
 

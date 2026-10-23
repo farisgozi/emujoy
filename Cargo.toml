@@ -4,6 +4,7 @@ members = [
     "crates/gba-core",
     "crates/emu-parser",
     "crates/headless",
+    "crates/frontend",
 ]
 
 [workspace.package]

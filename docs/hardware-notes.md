@@ -31,6 +31,59 @@ Template:
 - Source: ARM7TDMI TRM (programmer's model, exception entry).
 - Test: `arm_swi_enters_supervisor_with_spsr`, `two_instances_are_independent`.
 
+## CPU — the jsmolka quirk harvest (Phase 3)
+Each of these was found by a numbered jsmolka/gba-tests failure and
+is covered by that suite passing in full (arm/thumb/memory/flash):
+- **MSR immediate decode**: field mask is bits 19..16 of the
+  instruction, any value — demanding 0xF there misroutes MSR #imm
+  into data processing (arm 001).
+- **Mode banking**: USR/SYS R8..R14 live in a user shadow; a FIQ round
+  trip must restore them exactly, and privileged modes share R8..R12
+  with the user bank (arm psr tests; SP corruption otherwise).
+- **ROR by register 0**: value *and* carry pass through; ROR by
+  32/64 keeps the value but carry becomes bit 31 (arm 166, thumb 68).
+- **PC reads at +12**: when Rm/Rs/Rn is R15 in a data-processing op
+  with register-specified shift, and for STR/STM storing R15
+  (arm 224/225/356/515). Plain PC reads stay at +8.
+- **CMP/TST/TEQ/CMN with Rd=15, S=1**: restores CPSR from SPSR —
+  the documented way "bad" compares change the mode (arm 234).
+- **Load writeback vs Rd == Rn**: writeback lands first, the loaded
+  value wins (arm 360/412).
+- **STM base in list (not first)**: stores the writeback value
+  (thumb 230). **STM/LDM empty list**: R15 transferred, base
+  adjusts 0x40, transfer address computed as if 16 regs (arm 515/530).
+- **STM/LDM with S bit**: transfers the *user* bank registers from
+  any mode (arm 511).
+- **STRH at odd addresses**: aligned halfword store in normal
+  memory; single high-byte store in the byte-wide save region
+  (arm 407 vs flash 006 — the region decides, not the CPU).
+- **Video byte stores**: OAM ignores STRB; palette and BG VRAM
+  duplicate the byte into both halfword halves; OBJ VRAM ignores
+  (memory video_strb). Byte-store rules must not leak into 16/32-bit
+  stores — the bus has a separate raw path for those.
+- **GamePak mirror**: the full 32 MiB window mirrors the ROM by
+  window offset (memory 007).
+
+## Flash — command protocol (Phase 3)
+- Behaviour: writes are ignored unless preceded by the unlock pair
+  0xAA@0x5555, 0x55@0x2AAA. Program (0xA0) stores byte with AND
+  semantics (only clears bits). Erase (0x80 + fresh unlock) takes
+  0x10 = chip (current bank) / 0x30 = 4 KiB sector. ID mode (0x90)
+  makes offsets 0/1 read maker/device IDs until 0xF0. Bank switch
+  (0xB0 then write bank# at 0x0000) applies to 128 KiB parts only.
+- Source: GBATEK (flash ROM).
+- Chip identities modelled: Macronix — 64K maker 0xC2 device 0x1C,
+  128K maker 0xC2 device 0x09.
+- Test: `phase3.rs` — program/bit-clearing, ID mode round trip,
+  sector erase isolation, bank independence, 20-cycle save survival.
+
+## Save type detection (Phase 3)
+- Behaviour: the ROM embeds an ASCII marker ("FLASH1M_V...",
+  "FLASH512_V...", "FLASH_V...", "SRAM_V..."); the chip fitted is
+  chosen from it at load, defaulting to SRAM.
+- Source: GBATEK (save-type strings).
+- Test: `detection_from_rom_strings`.
+
 ## IRQ — IF is write-one-to-clear (Phase 2)
 - Behaviour: writing 1 bits to IF (0x04000202) clears those flags;
   word stores cannot ack IF because ARM word stores align their

@@ -27,6 +27,7 @@ pub mod cpu;
 pub mod dma;
 pub mod host;
 pub mod ppu;
+pub mod save;
 pub mod savestate;
 pub mod scheduler;
 
@@ -68,6 +69,12 @@ const REG_DISPSTAT: u32 = 0x0400_0004;
 const REG_KEYINPUT: u32 = 0x0400_0130;
 const IRQ_HANDLER_PTR: u32 = 0x0300_7FFC;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HleWait {
+    VBlank,
+    AnyIrq,
+}
+
 /// The whole machine. Owns everything by value; create as many as you
 /// like, they cannot interfere with each other.
 pub struct Core {
@@ -84,6 +91,14 @@ pub struct Core {
     timers: [Timer; 4],
     dma_prev_control: [u16; 4],
     keys_pressed: u16,
+    /// BIOS-less HLE wait state (IntrWait / VBlankIntrWait / Halt):
+    /// while set, the CPU is parked and only devices advance.
+    hle_wait: Option<HleWait>,
+    /// BIOS HLE is a boot policy, not a CPU behaviour: it activates
+    /// when the machine is booted via `boot_cartridge`/`boot_bios`
+    /// without a BIOS dump, so bare-CPU tests still see the raw SWI
+    /// exception semantics.
+    hle_enabled: bool,
 }
 
 impl Core {
@@ -99,6 +114,8 @@ impl Core {
             timers: [Timer::default(); 4],
             dma_prev_control: [0; 4],
             keys_pressed: 0,
+            hle_wait: None,
+            hle_enabled: false,
         };
         core.set_io16(REG_KEYINPUT, 0x03FF);
         core
@@ -122,12 +139,63 @@ impl Core {
         self.bus.load_bios(bios);
     }
 
+    /// The cartridge save contents (.sav image) for the frontend to
+    /// persist. Kind/size were fixed at ROM load by string detection.
+    pub fn save_data(&self) -> &[u8] {
+        &self.bus.save.data
+    }
+
+    /// Load a previously persisted .sav image into the save chip.
+    pub fn load_save_data(&mut self, bytes: &[u8]) {
+        self.bus.save.load_contents(bytes);
+    }
+
+    /// True when the save chip changed since the last load/ack —
+    /// frontends write the .sav file when this is set, then call
+    /// `ack_save_written`.
+    pub fn save_dirty(&self) -> bool {
+        self.bus.save.dirty
+    }
+
+    pub fn ack_save_written(&mut self) {
+        self.bus.save.dirty = false;
+    }
+
+    /// Device-state snapshot for the save-state format (v2 section).
+    pub(crate) fn device_snapshot(&self) -> ([u8; 2], [(u16, u16); 4], (u16, u64)) {
+        let mut timers = [(0u16, 0u16); 4];
+        for (i, t) in self.timers.iter().enumerate() {
+            timers[i] = (t.counter, t.reload);
+        }
+        (
+            self.pending_irq.to_le_bytes(),
+            timers,
+            self.ppu.timing_state(),
+        )
+    }
+
+    pub(crate) fn device_restore(
+        &mut self,
+        pending_irq: u16,
+        timers: [(u16, u16); 4],
+        ppu_timing: (u16, u64),
+    ) {
+        self.pending_irq = pending_irq;
+        for (i, (counter, reload)) in timers.iter().enumerate() {
+            self.timers[i].counter = *counter;
+            self.timers[i].reload = *reload;
+            self.timers[i].displayed = *counter;
+        }
+        self.ppu.restore_timing(ppu_timing.0, ppu_timing.1);
+    }
+
     /// Set up the register state the real BIOS leaves behind and jump
     /// straight to the cartridge entry point (0x08000000). Stack
     /// addresses and mode layout follow GBATEK's description of the
     /// BIOS-to-cartridge handoff.
     pub fn boot_cartridge(&mut self) {
         use cpu::{BIT_F, BIT_I, MODE_IRQ, MODE_SVC, MODE_SYS};
+        self.hle_enabled = !self.bus.bios_loaded;
         self.cpu.set_cpsr_full(MODE_IRQ | BIT_I | BIT_F);
         self.cpu.set_reg(13, 0x0300_7FA0);
         self.cpu.set_cpsr_full(MODE_SVC | BIT_I | BIT_F);
@@ -147,9 +215,67 @@ impl Core {
         self.cpu.set_pc(0);
     }
 
+    /// If the next instruction is a BIOS SWI and no BIOS dump is
+    /// loaded, return its number: the core HLEs the call instead of
+    /// vectoring into empty memory (Phase 3 BIOS handling).
+    fn peek_bios_swi(&self) -> Option<u32> {
+        if self.bus.bios_loaded || !self.hle_enabled {
+            return None;
+        }
+        let pc = self.cpu.pc();
+        if self.cpu.thumb_state() {
+            let instr = self.bus.read16(pc & !1);
+            if instr & 0xFF00 == 0xDF00 {
+                return Some(u32::from(instr & 0xFF));
+            }
+        } else {
+            let instr = self.bus.read32(pc & !3);
+            if instr & 0x0F00_0000 == 0x0F00_0000 {
+                let imm = instr & 0x00FF_FFFF;
+                return Some(if imm < 0x1_0000 { imm & 0xFF } else { imm >> 16 });
+            }
+        }
+        None
+    }
+
     /// Execute exactly one CPU instruction, then advance every device
     /// by its (Phase 1 approximate) cycle cost and service interrupts.
     pub fn step_instruction(&mut self) -> u32 {
+        // Parked by a BIOS wait call (HLE): advance devices only.
+        if let Some(wait) = self.hle_wait {
+            let chunk = 64;
+            let now = self.scheduler.now();
+            self.scheduler.advance_to(now + chunk);
+            self.advance_devices(chunk);
+            self.set_io16(REG_IF, self.pending_irq);
+            let wake = match wait {
+                HleWait::VBlank => self.ppu.frame_ready,
+                HleWait::AnyIrq => {
+                    let ie = self.bus.read16(REG_IE);
+                    ie & self.pending_irq != 0
+                }
+            };
+            if wake {
+                self.hle_wait = None;
+                if wait == HleWait::VBlank {
+                    self.ppu.frame_ready = false;
+                }
+            }
+            self.dispatch_irq();
+            return chunk as u32;
+        }
+        if let Some(swi) = self.peek_bios_swi() {
+            let size = if self.cpu.thumb_state() { 2 } else { 4 };
+            let ret = self.cpu.pc().wrapping_add(size);
+            self.cpu.set_pc(ret);
+            self.exec_bios_hle(swi);
+            let now = self.scheduler.now();
+            self.scheduler.advance_to(now + 8);
+            self.advance_devices(8);
+            self.set_io16(REG_IF, self.pending_irq);
+            self.dispatch_irq();
+            return 8;
+        }
         let cycles = self.cpu.step(&mut self.bus);
         let now = self.scheduler.now();
         self.scheduler.advance_to(now + u64::from(cycles));
@@ -293,6 +419,96 @@ impl Core {
         overflows
     }
 
+    /// High-level emulation of the BIOS calls games actually use,
+    /// active only when no BIOS dump is loaded. Register conventions
+    /// follow GBATEK. Unknown calls are skipped (return immediately),
+    /// which is strictly better than vectoring into empty memory.
+    fn exec_bios_hle(&mut self, swi: u32) {
+        match swi {
+            // SoftReset: re-enter the cartridge.
+            0x00 => self.boot_cartridge(),
+            // RegisterRamReset: clear the selected memory/registers.
+            0x01 => {
+                let flags = self.cpu.reg(0);
+                if flags & 0x01 != 0 {
+                    self.bus.ewram.fill(0);
+                }
+                if flags & 0x02 != 0 {
+                    self.bus.iwram.fill(0);
+                }
+                if flags & 0x04 != 0 {
+                    self.bus.palette.fill(0);
+                    self.bus.vram.fill(0);
+                    self.bus.oam.fill(0);
+                }
+                if flags & 0x08 != 0 {
+                    self.set_io16(0x0400_0000, 0);
+                }
+            }
+            // Halt / IntrWait / VBlankIntrWait: park the CPU.
+            0x02 => self.hle_wait = Some(HleWait::AnyIrq),
+            0x04 => self.hle_wait = Some(HleWait::AnyIrq),
+            0x05 => self.hle_wait = Some(HleWait::VBlank),
+            // Div: R0 = R0/R1, R1 = remainder, R3 = |quotient|.
+            0x06 => {
+                let num = self.cpu.reg(0) as i32;
+                let den = self.cpu.reg(1) as i32;
+                let (q, r) = if den == 0 {
+                    (if num >= 0 { 1 } else { -1 }, num)
+                } else if num == i32::MIN && den == -1 {
+                    (i32::MIN, 0) // overflow case per GBATEK
+                } else {
+                    (num / den, num % den)
+                };
+                self.cpu.set_reg(0, q as u32);
+                self.cpu.set_reg(1, r as u32);
+                self.cpu.set_reg(3, q.unsigned_abs());
+            }
+            // Sqrt: R0 = floor(sqrt(R0)).
+            0x08 => {
+                let v = self.cpu.reg(0);
+                self.cpu.set_reg(0, isqrt(v));
+            }
+            // CpuSet (0x0B) / CpuFastSet (0x0C).
+            0x0B | 0x0C => {
+                let mut src = self.cpu.reg(0);
+                let mut dst = self.cpu.reg(1);
+                let ctrl = self.cpu.reg(2);
+                let fill = ctrl & (1 << 24) != 0;
+                let wide = ctrl & (1 << 26) != 0;
+                let mut count = ctrl & 0x001F_FFFF;
+                if swi == 0x0C {
+                    count *= 8; // fast set counts 8-word blocks
+                }
+                for _ in 0..count {
+                    if wide {
+                        let v = self.bus.read32(src & !3);
+                        self.bus.write32(dst & !3, v);
+                        if !fill {
+                            src = src.wrapping_add(4);
+                        }
+                        dst = dst.wrapping_add(4);
+                    } else {
+                        let v = self.bus.read16(src & !1);
+                        self.bus.write16(dst & !1, v);
+                        if !fill {
+                            src = src.wrapping_add(2);
+                        }
+                        dst = dst.wrapping_add(2);
+                    }
+                }
+            }
+            // LZ77UnCompWram (0x11) / LZ77UnCompVram (0x12): the one
+            // decompressor test ROMs and many games lean on.
+            0x11 | 0x12 => {
+                let src = self.cpu.reg(0);
+                let dst = self.cpu.reg(1);
+                lz77_decompress(&mut self.bus, src, dst);
+            }
+            _ => {}
+        }
+    }
+
     fn dispatch_irq(&mut self) {
         let ie = self.bus.read16(REG_IE);
         let ime = self.bus.read16(REG_IME);
@@ -399,6 +615,66 @@ impl Core {
 impl Default for Core {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn isqrt(v: u32) -> u32 {
+    if v == 0 {
+        return 0;
+    }
+    let mut r = v;
+    let mut y = (r + 1) / 2;
+    while y < r {
+        r = y;
+        y = (r + v / r) / 2;
+    }
+    r
+}
+
+/// The BIOS LZ77 format (header word: 0x10 | length<<8, then blocks
+/// of 8 items flagged by one byte; literal = 1 byte, back-reference =
+/// 12-bit offset + 3-bit length+3). Writes go through the bus, so the
+/// VRAM variant inherits VRAM's write behaviour.
+fn lz77_decompress(bus: &mut Bus, mut src: u32, mut dst: u32) {
+    let header = bus.read32(src);
+    src = src.wrapping_add(4);
+    if header & 0xFF != 0x10 {
+        return;
+    }
+    let total = header >> 8;
+    let mut written: u32 = 0;
+    while written < total {
+        let flags = bus.read8(src);
+        src = src.wrapping_add(1);
+        for bit in (0..8).rev() {
+            if written >= total {
+                break;
+            }
+            if flags & (1 << bit) == 0 {
+                let b = bus.read8(src);
+                src = src.wrapping_add(1);
+                bus.write8(dst, b);
+                dst = dst.wrapping_add(1);
+                written += 1;
+            } else {
+                let b0 = bus.read8(src);
+                let b1 = bus.read8(src.wrapping_add(1));
+                src = src.wrapping_add(2);
+                let len = u32::from(b0 >> 4) + 3;
+                let off = (u32::from(b0 & 0xF) << 8) | u32::from(b1);
+                let mut from = dst.wrapping_sub(off + 1);
+                for _ in 0..len {
+                    if written >= total {
+                        break;
+                    }
+                    let b = bus.read8(from);
+                    from = from.wrapping_add(1);
+                    bus.write8(dst, b);
+                    dst = dst.wrapping_add(1);
+                    written += 1;
+                }
+            }
+        }
     }
 }
 

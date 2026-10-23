@@ -44,6 +44,19 @@ impl Ppu {
         Self { line: 0, cycle_in_frame: 0, hblank_signalled: false, line_rendered: false, frame_ready: false }
     }
 
+    /// (line, cycle accumulator) for save states.
+    pub fn timing_state(&self) -> (u16, u64) {
+        (self.line, self.cycle_in_frame)
+    }
+
+    pub fn restore_timing(&mut self, line: u16, cycle_in_frame: u64) {
+        self.line = line % LINES_PER_FRAME;
+        self.cycle_in_frame = cycle_in_frame;
+        self.hblank_signalled = false;
+        self.line_rendered = false;
+        self.frame_ready = false;
+    }
+
     /// Advance PPU time. Rendering + DISPSTAT/VCOUNT maintenance happen
     /// against the bus; IRQ-raising events are returned for the core.
     pub fn advance(

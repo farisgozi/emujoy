@@ -59,14 +59,13 @@ pub fn step_arm(cpu: &mut Cpu, bus: &mut Bus) -> u32 {
             exec_data_processing(cpu, instr)
         }
         0b001 => {
-            // MSR immediate hides inside the TEQ/CMN opcode space with
-            // S=0 and Rn=Rd=1111: 001 10R1 1111 mask 1111 rot imm8.
-            let op = (instr >> 21) & 0xF;
-            if (op == 0x9 || op == 0xB)
-                && instr & (1 << 20) == 0
-                && (instr >> 16) & 0xF == 0xF
-                && (instr >> 12) & 0xF == 0xF
-            {
+            // MSR immediate hides inside the test-opcode space:
+            // 0011 0R10 <field mask> 1111 <rot> <imm8>. The field mask
+            // (bits 19..16) is part of the instruction, NOT a fixed
+            // 1111 — an earlier decode demanded 0xF there and silently
+            // dropped MSR #imm into data processing (caught by
+            // jsmolka arm test 001: MSR CPSR_f, #FLAG_Z).
+            if instr & 0x0FB0_F000 == 0x0320_F000 {
                 return exec_msr_imm(cpu, instr);
             }
             exec_data_processing(cpu, instr)
@@ -136,18 +135,28 @@ fn shifter_operand(cpu: &Cpu, instr: u32, i_bit: bool) -> (u32, bool) {
             (v, v >> 31 != 0)
         }
     } else {
-        let rm = cpu.reg((instr & 0xF) as usize);
+        let rm_idx = (instr & 0xF) as usize;
         let shift_type = (instr >> 5) & 0x3;
         if instr & (1 << 4) != 0 {
-            // Shift by register: amount is Rs low byte; PC reads are
-            // +4 further on real hardware when Rm/Rs is R15 — our reg()
-            // already models the fetch offset; the extra +4 for R15 as
-            // operand is an acceptable Phase 1 simplification noted in
-            // hardware-notes.
-            let amount = cpu.reg(((instr >> 8) & 0xF) as usize) & 0xFF;
-            // Register-specified LSL with amount 0 keeps carry.
+            // Shift by register: when Rm or Rs is R15, the value read
+            // is instruction address + 12 (one pipeline stage further
+            // than the usual +8) — jsmolka arm test 224
+            // (`mov r0, pc, lsl r0`) pins this down. regs[15] here is
+            // already address+4, so +8 more reaches +12.
+            let rm = if rm_idx == 15 {
+                cpu.regs[15].wrapping_add(8)
+            } else {
+                cpu.reg(rm_idx)
+            };
+            let rs_idx = ((instr >> 8) & 0xF) as usize;
+            let amount = if rs_idx == 15 {
+                cpu.regs[15].wrapping_add(8) & 0xFF
+            } else {
+                cpu.reg(rs_idx) & 0xFF
+            };
             barrel_shift(rm, shift_type, amount, carry, true)
         } else {
+            let rm = cpu.reg(rm_idx);
             let amount = (instr >> 7) & 0x1F;
             barrel_shift(rm, shift_type, amount, carry, false)
         }
@@ -166,7 +175,13 @@ fn exec_data_processing(cpu: &mut Cpu, instr: u32) -> u32 {
     // and S=0 encode MSR flag fields — rare; Phase 1 treats S=0 test
     // opcodes as their (architecturally unused) compare anyway.
 
-    let a = cpu.reg(rn);
+    // PC as operand 1 also reads +12 (not +8) when operand 2 is a
+    // register-specified shift (jsmolka arm test 225).
+    let a = if rn == 15 && !i_bit && instr & (1 << 4) != 0 {
+        cpu.regs[15].wrapping_add(8)
+    } else {
+        cpu.reg(rn)
+    };
     let (b, shifter_carry) = shifter_operand(cpu, instr, i_bit);
     let carry_in = cpu.flag(FLAG_C);
 
@@ -193,6 +208,18 @@ fn exec_data_processing(cpu: &mut Cpu, instr: u32) -> u32 {
         _ => result = !b,                            // MVN
     }
 
+    if rd == 15 && s_bit {
+        // Rd=PC with S restores CPSR from SPSR (exception return) —
+        // and this applies to the test opcodes too: a CMP with Rd
+        // encoded as 15 changes the mode instead of just setting
+        // flags (jsmolka arm test 234 relies on exactly this).
+        let spsr = cpu.spsr();
+        if !is_test {
+            cpu.set_reg(rd, result);
+        }
+        cpu.set_cpsr_full(spsr);
+        return 3;
+    }
     if is_test || s_bit {
         match arith {
             Some((c, v)) => cpu.set_nzcv(result, c, v),
@@ -200,14 +227,7 @@ fn exec_data_processing(cpu: &mut Cpu, instr: u32) -> u32 {
         }
     }
     if !is_test {
-        if rd == 15 && s_bit {
-            // Rd=PC with S: restore CPSR from SPSR (exception return).
-            let spsr = cpu.spsr();
-            cpu.set_reg(rd, result);
-            cpu.set_cpsr_full(spsr);
-        } else {
-            cpu.set_reg(rd, result);
-        }
+        cpu.set_reg(rd, result);
     }
     if rd == 15 && !is_test { 3 } else { 1 }
 }
@@ -329,7 +349,17 @@ fn exec_load_store(cpu: &mut Cpu, bus: &mut Bus, instr: u32, reg_offset: bool) -
         base
     };
 
+    // Writeback value, applied at different points per direction:
+    // for loads it lands BEFORE Rd is set, so when Rd == Rn the
+    // loaded value wins (jsmolka arm test 360); for stores it lands
+    // after, so a stored Rn keeps its original value.
+    let new_base = if u { base.wrapping_add(offset) } else { base.wrapping_sub(offset) };
+    let writeback = !p || w;
+
     if l {
+        if writeback {
+            cpu.set_reg(rn, new_base);
+        }
         let value = if b {
             u32::from(bus.read8(transfer_addr))
         } else {
@@ -338,20 +368,21 @@ fn exec_load_store(cpu: &mut Cpu, bus: &mut Bus, instr: u32, reg_offset: bool) -
         };
         cpu.set_reg(rd, value);
     } else {
-        let value = cpu.reg(rd);
+        // STR of R15 stores instruction address + 12 (jsmolka arm
+        // test 356), not the +8 a plain PC read returns.
+        let value = if rd == 15 {
+            cpu.regs[15].wrapping_add(8)
+        } else {
+            cpu.reg(rd)
+        };
         if b {
             bus.write8(transfer_addr, value as u8);
         } else {
-            bus.write32(transfer_addr & !3, value);
+            bus.write32(transfer_addr, value);
         }
     }
 
-    if !p {
-        // Post-indexed: always writes back.
-        let new_base = if u { base.wrapping_add(offset) } else { base.wrapping_sub(offset) };
-        cpu.set_reg(rn, new_base);
-    } else if w {
-        let new_base = if u { base.wrapping_add(offset) } else { base.wrapping_sub(offset) };
+    if !l && writeback {
         cpu.set_reg(rn, new_base);
     }
     3
@@ -403,22 +434,40 @@ fn exec_extra_load_store(cpu: &mut Cpu, bus: &mut Bus, instr: u32) -> u32 {
         base
     };
 
+    // Same writeback ordering rule as word transfers: loads apply
+    // writeback before Rd so Rd == Rn keeps the loaded value
+    // (jsmolka arm test 412); stores apply it after.
+    let wb_value = if u { base.wrapping_add(offset) } else { base.wrapping_sub(offset) };
+    let do_wb = !p || w;
     if l {
+        if do_wb {
+            cpu.set_reg(rn, wb_value);
+        }
         let value = match sh {
-            0b01 => u32::from(bus.read16(addr & !1)),
+            // LDRH: misaligned reads return the aligned halfword
+            // rotated right by 8 (GBA behaviour, jsmolka thumb 211).
+            0b01 => u32::from(bus.read16(addr & !1)).rotate_right((addr & 1) * 8),
             0b10 => u32::from(bus.read8(addr) as i8 as i32 as u32),
-            _ => u32::from(bus.read16(addr & !1) as i16 as i32 as u32),
+            // LDRSH: at an odd address it behaves like LDRSB.
+            _ => {
+                if addr & 1 != 0 {
+                    u32::from(bus.read8(addr) as i8 as i32 as u32)
+                } else {
+                    u32::from(bus.read16(addr & !1) as i16 as i32 as u32)
+                }
+            }
         };
         cpu.set_reg(rd, value);
     } else {
-        // STRH is the only store here (SH=01 with L=0).
+        // STRH is the only store here (SH=01 with L=0). The bus
+        // applies the region rule for odd addresses: aligned
+        // halfword store in normal memory, single high-byte store
+        // in the byte-wide save region.
         let value = cpu.reg(rd);
-        bus.write16(addr & !1, value as u16);
-    }
-
-    if !p || w {
-        let new_base = if u { base.wrapping_add(offset) } else { base.wrapping_sub(offset) };
-        cpu.set_reg(rn, new_base);
+        bus.write16(addr, value as u16);
+        if do_wb {
+            cpu.set_reg(rn, wb_value);
+        }
     }
     3
 }
@@ -447,13 +496,23 @@ fn exec_block_transfer(cpu: &mut Cpu, bus: &mut Bus, instr: u32) -> u32 {
     };
 
     if count == 0 {
-        // Empty list: R15 is transferred on ARMv4 and base adjusts by 0x40.
+        // Empty list: R15 is transferred on ARMv4 and base adjusts by
+        // 0x40; the transfer address is computed as if all 16
+        // registers were in the list (test 530: STMDA stores at
+        // base-0x3C).
         let adj = if u { base.wrapping_add(0x40) } else { base.wrapping_sub(0x40) };
+        let xfer = match (p, u) {
+            (false, true) => base,
+            (true, true) => base.wrapping_add(4),
+            (false, false) => base.wrapping_sub(0x3C),
+            (true, false) => base.wrapping_sub(0x40),
+        };
         if l {
-            let v = bus.read32(start & !3);
+            let v = bus.read32(xfer & !3);
             cpu.regs[15] = v & !3;
         } else {
-            bus.write32(start & !3, cpu.reg(15));
+            // Stored PC is instruction address + 12 (test 515).
+            bus.write32(xfer, cpu.regs[15].wrapping_add(8));
         }
         if w {
             cpu.set_reg(rn, adj);
@@ -461,6 +520,7 @@ fn exec_block_transfer(cpu: &mut Cpu, bus: &mut Bus, instr: u32) -> u32 {
         return 4;
     }
 
+    let lowest = (0..16usize).find(|&r| list & (1 << r) != 0).unwrap_or(0);
     let mut addr = start;
     for reg in 0..16usize {
         if list & (1 << reg) == 0 {
@@ -475,16 +535,28 @@ fn exec_block_transfer(cpu: &mut Cpu, bus: &mut Bus, instr: u32) -> u32 {
                     let spsr = cpu.spsr();
                     cpu.set_cpsr_full(spsr);
                 }
+            } else if s {
+                // Load into the user bank (S bit, no PC in list).
+                cpu.set_user_reg(reg, v);
             } else {
                 cpu.set_reg(reg, v);
             }
         } else {
-            // Store: R15 stores the pipeline value (addr of instr + 12
-            // on real hardware from a base of +8 model: our reg(15)
-            // returns +8 relative to the instruction; hardware stores
-            // +12 — noted as a Phase 1 simplification).
-            let v = cpu.reg(reg);
-            bus.write32(addr & !3, v);
+            // Store quirks: R15 stores instruction address + 12
+            // (regs[15] holds +4 in our model, reg() reads +8). The
+            // base register, when in the list but not first, stores
+            // its writeback value (jsmolka thumb test 230). With the
+            // S bit, values come from the user bank (test 511).
+            let v = if s && reg != 15 {
+                cpu.user_reg(reg)
+            } else if reg == 15 {
+                cpu.regs[15].wrapping_add(8)
+            } else if reg == rn && reg != lowest {
+                writeback
+            } else {
+                cpu.reg(reg)
+            };
+            bus.write32(addr, v);
         }
         addr = addr.wrapping_add(4);
     }

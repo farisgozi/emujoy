@@ -1,0 +1,10 @@
+[package]
+name = "frontend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Linux desktop frontend: window, keyboard input, .sav persistence for the emu-core."
+
+[dependencies]
+gba-core = { path = "../gba-core" }
+minifb = "0.28"

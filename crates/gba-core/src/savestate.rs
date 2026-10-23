@@ -21,12 +21,17 @@ use alloc::vec::Vec;
 use crate::scheduler::EventKind;
 use crate::Core;
 
-pub const FORMAT_VERSION: u16 = 1;
+/// Current format version. v2 (Phase 3) adds the DEVICES and SAVEMEM
+/// sections; the loader still accepts v1 files (devices simply keep
+/// their current state, as v1 had none to restore).
+pub const FORMAT_VERSION: u16 = 2;
 const MAGIC: &[u8; 8] = b"EMUSTATE";
 
 const SECTION_CPU: u16 = 1;
 const SECTION_SCHEDULER: u16 = 2;
 const SECTION_MEMORY: u16 = 3;
+const SECTION_DEVICES: u16 = 4;
+const SECTION_SAVEMEM: u16 = 5;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SaveError {
@@ -130,6 +135,34 @@ pub fn save(core: &Core) -> Vec<u8> {
     mem.extend_from_slice(&*core.bus.vram);
     w.section(SECTION_MEMORY, &mem);
 
+    // Devices section (v2): pending IRQ, timer counters/reloads, PPU
+    // timing. Fixed 28-byte payload.
+    let (irq_bytes, timers, ppu_timing) = core.device_snapshot();
+    let mut dev = Vec::with_capacity(28);
+    dev.extend_from_slice(&irq_bytes);
+    for (counter, reload) in timers {
+        dev.extend_from_slice(&counter.to_le_bytes());
+        dev.extend_from_slice(&reload.to_le_bytes());
+    }
+    dev.extend_from_slice(&ppu_timing.0.to_le_bytes());
+    dev.extend_from_slice(&ppu_timing.1.to_le_bytes());
+    w.section(SECTION_DEVICES, &dev);
+
+    // Save-memory section (v2): chip kind tag + bank/id state + the
+    // full contents, so a state captures the battery save too.
+    let (bank, id_mode) = core.bus.save.state_words();
+    let mut sm = Vec::with_capacity(4 + core.bus.save.data.len());
+    sm.push(match core.bus.save.kind {
+        crate::save::SaveKind::Sram => 0,
+        crate::save::SaveKind::Flash64 => 1,
+        crate::save::SaveKind::Flash128 => 2,
+    });
+    sm.push(bank);
+    sm.push(id_mode as u8);
+    sm.push(0);
+    sm.extend_from_slice(&core.bus.save.data);
+    w.section(SECTION_SAVEMEM, &sm);
+
     w.buf
 }
 
@@ -139,7 +172,7 @@ pub fn load(core: &mut Core, data: &[u8]) -> Result<(), SaveError> {
         return Err(SaveError::BadMagic);
     }
     let version = r.u16()?;
-    if version != FORMAT_VERSION {
+    if version != 1 && version != FORMAT_VERSION {
         return Err(SaveError::UnsupportedVersion(version));
     }
     let _flags = r.u16()?;
@@ -206,6 +239,40 @@ pub fn load(core: &mut Core, data: &[u8]) -> Result<(), SaveError> {
                 core.bus.ewram.copy_from_slice(ew);
                 core.bus.iwram.copy_from_slice(iw);
                 core.bus.vram.copy_from_slice(vr);
+            }
+            SECTION_DEVICES => {
+                if payload.len() != 28 {
+                    return Err(SaveError::BadPayload { section: id });
+                }
+                let mut pr = Reader { data: payload, pos: 0 };
+                let pending = pr.u16()?;
+                let mut timers = [(0u16, 0u16); 4];
+                for t in timers.iter_mut() {
+                    t.0 = pr.u16()?;
+                    t.1 = pr.u16()?;
+                }
+                let line = pr.u16()?;
+                let cyc = pr.u64()?;
+                core.device_restore(pending, timers, (line, cyc));
+            }
+            SECTION_SAVEMEM => {
+                if payload.len() < 4 {
+                    return Err(SaveError::BadPayload { section: id });
+                }
+                let kind = match payload[0] {
+                    0 => crate::save::SaveKind::Sram,
+                    1 => crate::save::SaveKind::Flash64,
+                    2 => crate::save::SaveKind::Flash128,
+                    _ => return Err(SaveError::BadPayload { section: id }),
+                };
+                let contents = &payload[4..];
+                if contents.len() != kind.size() {
+                    return Err(SaveError::BadPayload { section: id });
+                }
+                if core.bus.save.kind != kind {
+                    core.bus.save = crate::save::SaveMemory::new(kind);
+                }
+                core.bus.save.restore_state(payload[1], payload[2] != 0, contents);
             }
             // Unknown section: ignored by design (forward compatibility),
             // but it was still length- and CRC-checked above.

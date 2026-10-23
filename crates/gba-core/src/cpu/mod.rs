@@ -44,6 +44,7 @@ pub struct Cpu {
     regs: [u32; 16],
     cpsr: u32,
     // Banked shadows.
+    usr_regs: [u32; 7], // R8..R14 in USR/SYS mode (the shared bank)
     fiq_regs: [u32; 7], // R8..R14 in FIQ mode
     svc_regs: [u32; 2], // R13, R14
     abt_regs: [u32; 2],
@@ -68,6 +69,7 @@ impl Default for Cpu {
             // Supervisor, ARM state, IRQ+FIQ disabled: the conventional
             // post-reset defined state for Phase 1.
             cpsr: MODE_SVC | BIT_I | BIT_F,
+            usr_regs: [0; 7],
             fiq_regs: [0; 7],
             svc_regs: [0; 2],
             abt_regs: [0; 2],
@@ -221,10 +223,27 @@ impl Cpu {
             MODE_FIQ => {
                 self.fiq_regs.copy_from_slice(&self.regs[8..15]);
             }
-            MODE_SVC => self.svc_regs.copy_from_slice(&self.regs[13..15]),
-            MODE_ABT => self.abt_regs.copy_from_slice(&self.regs[13..15]),
-            MODE_UND => self.und_regs.copy_from_slice(&self.regs[13..15]),
-            MODE_IRQ => self.irq_regs.copy_from_slice(&self.regs[13..15]),
+            MODE_USER | MODE_SYS => {
+                self.usr_regs.copy_from_slice(&self.regs[8..15]);
+            }
+            // Privileged modes share R8..R12 with the user bank:
+            // refresh that part of the user shadow on the way out too.
+            MODE_SVC => {
+                self.usr_regs[..5].copy_from_slice(&self.regs[8..13]);
+                self.svc_regs.copy_from_slice(&self.regs[13..15]);
+            }
+            MODE_ABT => {
+                self.usr_regs[..5].copy_from_slice(&self.regs[8..13]);
+                self.abt_regs.copy_from_slice(&self.regs[13..15]);
+            }
+            MODE_UND => {
+                self.usr_regs[..5].copy_from_slice(&self.regs[8..13]);
+                self.und_regs.copy_from_slice(&self.regs[13..15]);
+            }
+            MODE_IRQ => {
+                self.usr_regs[..5].copy_from_slice(&self.regs[8..13]);
+                self.irq_regs.copy_from_slice(&self.regs[13..15]);
+            }
             _ => {}
         }
     }
@@ -234,10 +253,56 @@ impl Cpu {
             MODE_FIQ => {
                 self.regs[8..15].copy_from_slice(&self.fiq_regs);
             }
-            MODE_SVC => self.regs[13..15].copy_from_slice(&self.svc_regs),
-            MODE_ABT => self.regs[13..15].copy_from_slice(&self.abt_regs),
-            MODE_UND => self.regs[13..15].copy_from_slice(&self.und_regs),
-            MODE_IRQ => self.regs[13..15].copy_from_slice(&self.irq_regs),
+            MODE_USER | MODE_SYS => {
+                self.regs[8..15].copy_from_slice(&self.usr_regs);
+            }
+            MODE_SVC => {
+                self.regs[8..13].copy_from_slice(&self.usr_regs[..5]);
+                self.regs[13..15].copy_from_slice(&self.svc_regs);
+            }
+            MODE_ABT => {
+                self.regs[8..13].copy_from_slice(&self.usr_regs[..5]);
+                self.regs[13..15].copy_from_slice(&self.abt_regs);
+            }
+            MODE_UND => {
+                self.regs[8..13].copy_from_slice(&self.usr_regs[..5]);
+                self.regs[13..15].copy_from_slice(&self.und_regs);
+            }
+            MODE_IRQ => {
+                self.regs[8..13].copy_from_slice(&self.usr_regs[..5]);
+                self.regs[13..15].copy_from_slice(&self.irq_regs);
+            }
+            _ => {}
+        }
+    }
+
+    /// Read a register as seen in the user bank (for LDM/STM with the
+    /// S bit, which transfer user registers from any mode).
+    pub fn user_reg(&self, n: usize) -> u32 {
+        match n {
+            0..=7 => self.regs[n],
+            8..=14 => {
+                if matches!(self.mode(), MODE_USER | MODE_SYS) {
+                    self.regs[n]
+                } else {
+                    self.usr_regs[n - 8]
+                }
+            }
+            _ => self.reg(15),
+        }
+    }
+
+    /// Write a register in the user bank (LDM with S bit).
+    pub fn set_user_reg(&mut self, n: usize, value: u32) {
+        match n {
+            0..=7 => self.regs[n] = value,
+            8..=14 => {
+                if matches!(self.mode(), MODE_USER | MODE_SYS) {
+                    self.regs[n] = value;
+                } else {
+                    self.usr_regs[n - 8] = value;
+                }
+            }
             _ => {}
         }
     }
@@ -359,6 +424,13 @@ pub fn barrel_shift(
                 // RRX: rotate right through carry by 1.
                 let out = (value >> 1) | ((carry_in as u32) << 31);
                 (out, value & 1 != 0)
+            } else if amount_is_register && amount == 0 {
+                // Register-specified shift of exactly 0: value and
+                // carry both pass through untouched (jsmolka arm 166
+                // / thumb 68). This differs from amount 32/64..., where
+                // the value also passes through but carry becomes
+                // bit 31 of the value.
+                (value, carry_in)
             } else {
                 let amt = amount & 31;
                 if amt == 0 {

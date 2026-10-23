@@ -52,9 +52,9 @@ pub fn step_thumb(cpu: &mut Cpu, bus: &mut Bus) -> u32 {
                 let a = cpu.reg(rb).wrapping_add(off);
                 if l {
                     let v = bus.read16(a & !1);
-                    cpu.set_reg(rd, u32::from(v));
+                    cpu.set_reg(rd, u32::from(v).rotate_right((a & 1) * 8));
                 } else {
-                    bus.write16(a & !1, cpu.reg(rd) as u16);
+                    bus.write16(a, cpu.reg(rd) as u16);
                 }
                 3
             } else {
@@ -67,7 +67,7 @@ pub fn step_thumb(cpu: &mut Cpu, bus: &mut Bus) -> u32 {
                     let v = bus.read32(a & !3);
                     cpu.set_reg(rd, v.rotate_right((a & 3) * 8));
                 } else {
-                    bus.write32(a & !3, cpu.reg(rd));
+                    bus.write32(a, cpu.reg(rd));
                 }
                 3
             }
@@ -284,7 +284,7 @@ fn thumb_ls_reg(cpu: &mut Cpu, bus: &mut Bus, instr: u16) -> u32 {
     } else if b {
         bus.write8(a, cpu.reg(rd) as u8);
     } else {
-        bus.write32(a & !3, cpu.reg(rd));
+        bus.write32(a, cpu.reg(rd));
     }
     3
 }
@@ -297,18 +297,27 @@ fn thumb_ls_sign(cpu: &mut Cpu, bus: &mut Bus, instr: u16) -> u32 {
     let rd = (instr & 0x7) as usize;
     let a = rb.wrapping_add(ro);
     match (h, s) {
-        (false, false) => bus.write16(a & !1, cpu.reg(rd) as u16), // STRH
+        (false, false) => {
+            // STRH — the bus applies the odd-address region rule.
+            bus.write16(a, cpu.reg(rd) as u16);
+        }
         (false, true) => {
             // LDRSB
             cpu.set_reg(rd, u32::from(bus.read8(a) as i8 as i32 as u32));
         }
         (true, false) => {
+            // LDRH: misaligned reads rotate the aligned halfword.
             let v = bus.read16(a & !1);
-            cpu.set_reg(rd, u32::from(v));
+            cpu.set_reg(rd, u32::from(v).rotate_right((a & 1) * 8));
         }
         _ => {
-            let v = bus.read16(a & !1) as i16;
-            cpu.set_reg(rd, v as i32 as u32);
+            // LDRSH: odd address behaves like LDRSB.
+            if a & 1 != 0 {
+                cpu.set_reg(rd, u32::from(bus.read8(a) as i8 as i32 as u32));
+            } else {
+                let v = bus.read16(a & !1) as i16;
+                cpu.set_reg(rd, v as i32 as u32);
+            }
         }
     }
     3
@@ -331,7 +340,7 @@ fn thumb_ls_imm(cpu: &mut Cpu, bus: &mut Bus, instr: u16) -> u32 {
     } else if b {
         bus.write8(a, cpu.reg(rd) as u8);
     } else {
-        bus.write32(a & !3, cpu.reg(rd));
+        bus.write32(a, cpu.reg(rd));
     }
     3
 }
@@ -387,11 +396,15 @@ fn thumb_block(cpu: &mut Cpu, bus: &mut Bus, instr: u16) -> u32 {
             let v = bus.read32(addr & !3);
             cpu.regs[15] = v & !1;
         } else {
-            bus.write32(addr & !3, cpu.reg(15));
+            // THUMB STM stores PC as seen two bytes further along
+            // than a plain PC read (jsmolka thumb test 229 compares
+            // the stored value against a following MOV Rd, PC).
+            bus.write32(addr & !3, cpu.reg(15).wrapping_add(2));
         }
         cpu.set_reg(rb, base.wrapping_add(0x40));
         return 4;
     }
+    let lowest = (0..8usize).find(|&r| list & (1 << r) != 0).unwrap_or(0);
     for reg in 0..8usize {
         if list & (1 << reg) == 0 {
             continue;
@@ -399,8 +412,12 @@ fn thumb_block(cpu: &mut Cpu, bus: &mut Bus, instr: u16) -> u32 {
         if l {
             let v = bus.read32(addr & !3);
             cpu.set_reg(reg, v);
+        } else if reg == rb && reg != lowest {
+            // Base in the list but not first: stores the writeback
+            // value (base + 4*count), per ARMv4 (thumb test 230).
+            bus.write32(addr, base.wrapping_add(list.count_ones() * 4));
         } else {
-            bus.write32(addr & !3, cpu.reg(reg));
+            bus.write32(addr, cpu.reg(reg));
         }
         addr = addr.wrapping_add(4);
     }

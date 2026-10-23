@@ -396,3 +396,26 @@ fn thumb_sub_imm_negative_flag() {
     assert!(m.flag(FLAG_N));
     assert!(!m.flag(FLAG_C), "3 - 5 borrows, C must clear");
 }
+
+#[test]
+fn fiq_roundtrip_preserves_user_bank() {
+    // Regression: switching SYS -> FIQ -> SYS must restore the user
+    // bank's R8..R14 exactly (an earlier swap implementation let the
+    // FIQ bank leak into the user view, corrupting SP — this is what
+    // jsmolka's psr_transfer tests caught).
+    use gba_core::cpu::{MODE_FIQ, MODE_SYS};
+    let mut core = gba_core::Core::new();
+    core.cpu.set_cpsr_full(MODE_SYS);
+    core.cpu.set_reg(8, 0x1111_1111);
+    core.cpu.set_reg(13, 0x0300_7F00);
+    core.cpu.set_cpsr_full(MODE_FIQ);
+    assert_eq!(core.cpu.reg(13), 0, "FIQ bank starts separate");
+    core.cpu.set_reg(8, 0x2222_2222);
+    core.cpu.set_reg(13, 0x0300_7000);
+    core.cpu.set_cpsr_full(MODE_SYS);
+    assert_eq!(core.cpu.reg(8), 0x1111_1111, "user R8 restored");
+    assert_eq!(core.cpu.reg(13), 0x0300_7F00, "user SP restored");
+    core.cpu.set_cpsr_full(MODE_FIQ);
+    assert_eq!(core.cpu.reg(8), 0x2222_2222, "FIQ R8 kept");
+    assert_eq!(core.cpu.reg(13), 0x0300_7000, "FIQ SP kept");
+}

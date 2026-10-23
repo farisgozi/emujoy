@@ -174,7 +174,7 @@ fn obj_sprite_renders_over_background() {
     core.bus.write16(0x0500_0204, 0x03E0); // OBJ palette #2 = green
     // OBJ tile 0 (at VRAM 0x06010000): all nibble 2.
     for i in 0..32 {
-        core.bus.write8(0x0601_0000 + i, 0x22);
+        core.bus.write16(0x0601_0000 + i * 2, 0x2222);
     }
     // OAM entry 0: y=0, x=16, 8x8, tile 0.
     core.bus.write16(0x0700_0000, 0);
