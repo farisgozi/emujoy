@@ -1,4 +1,4 @@
-# emu-core
+# EmuJoy
 
 A clean-room emulation core built from scratch — first target **Game Boy
 Advance** (acceptance game: *Harvest Moon: Friends of Mineral Town*),
