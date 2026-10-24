@@ -24,7 +24,19 @@ use crate::Core;
 /// Current format version. v2 (Phase 3) adds the DEVICES and SAVEMEM
 /// sections; the loader still accepts v1 files (devices simply keep
 /// their current state, as v1 had none to restore).
-pub const FORMAT_VERSION: u16 = 2;
+///
+/// v3 fixes two v2 omissions that made mid-game states unloadable:
+/// the CPU section now carries the full banked register file (v2
+/// saved only the active view, so IRQ/SVC stack pointers restored
+/// as zero and the CPU ran away on the first interrupt), and the
+/// MEMORY section now includes palette RAM, OAM and the IO page
+/// (v2 restored a machine with DISPCNT=0 and black palettes). The
+/// DEVICES section grew the DMA edge latches, the BIOS-stub flag
+/// and the HLE wait tag. Known remaining gaps: APU channel state
+/// and the PPU's affine internal reference points are not saved
+/// (audio re-triggers through the game's own engine; affine refs
+/// resync at the next frame start).
+pub const FORMAT_VERSION: u16 = 3;
 const MAGIC: &[u8; 8] = b"EMUSTATE";
 
 const SECTION_CPU: u16 = 1;
@@ -84,6 +96,9 @@ impl<'a> Reader<'a> {
         self.pos = end;
         Ok(slice)
     }
+    fn u8(&mut self) -> Result<u8, SaveError> {
+        Ok(self.take(1)?[0])
+    }
     fn u16(&mut self) -> Result<u16, SaveError> {
         let b = self.take(2)?;
         Ok(u16::from_le_bytes([b[0], b[1]]))
@@ -105,13 +120,13 @@ pub fn save(core: &Core) -> Vec<u8> {
     w.buf.extend_from_slice(&0u16.to_le_bytes()); // flags
     w.buf.extend_from_slice(&core.bus.rom_hash().to_le_bytes());
 
-    // CPU section: 16 raw regs (R15 = next fetch address) + CPSR.
-    let (regs, cpsr) = core.cpu.snapshot_regs();
-    let mut cpu = Vec::with_capacity(68);
-    for r in regs {
+    // CPU section (v3): the full 44-word register file (active regs,
+    // CPSR, banked shadows, SPSRs) — see Cpu::snapshot_full.
+    let full = core.cpu.snapshot_full();
+    let mut cpu = Vec::with_capacity(176);
+    for r in full {
         cpu.extend_from_slice(&r.to_le_bytes());
     }
-    cpu.extend_from_slice(&cpsr.to_le_bytes());
     w.section(SECTION_CPU, &cpu);
 
     // Scheduler section: now + (at, kind-tag) per pending event.
@@ -126,19 +141,32 @@ pub fn save(core: &Core) -> Vec<u8> {
     }
     w.section(SECTION_SCHEDULER, &sched);
 
-    // Memory section: the writable regions, concatenated in fixed order.
+    // Memory section: the writable regions, concatenated in fixed
+    // order. v3 appends palette RAM, OAM and the IO register page —
+    // without them the display and every device register restored
+    // as zero.
     let mut mem = Vec::with_capacity(
-        crate::bus::EWRAM_LEN + crate::bus::IWRAM_LEN + crate::bus::VRAM_LEN,
+        crate::bus::EWRAM_LEN
+            + crate::bus::IWRAM_LEN
+            + crate::bus::VRAM_LEN
+            + crate::bus::PALETTE_LEN
+            + crate::bus::OAM_LEN
+            + crate::bus::IO_LEN,
     );
     mem.extend_from_slice(&*core.bus.ewram);
     mem.extend_from_slice(&*core.bus.iwram);
     mem.extend_from_slice(&*core.bus.vram);
+    mem.extend_from_slice(&*core.bus.palette);
+    mem.extend_from_slice(&*core.bus.oam);
+    mem.extend_from_slice(&*core.bus.io);
     w.section(SECTION_MEMORY, &mem);
 
-    // Devices section (v2): pending IRQ, timer counters/reloads, PPU
-    // timing. Fixed 28-byte payload.
-    let (irq_bytes, timers, ppu_timing) = core.device_snapshot();
-    let mut dev = Vec::with_capacity(28);
+    // Devices section: v2's 28 bytes (pending IRQ, timer
+    // counters/reloads, PPU timing) plus v3's DMA latches (8),
+    // BIOS-stub flag (1) and HLE wait tag (1) and 2 pad bytes.
+    let (irq_bytes, timers, ppu_timing, dma_prev, stub_active, hle_tag) =
+        core.device_snapshot();
+    let mut dev = Vec::with_capacity(40);
     dev.extend_from_slice(&irq_bytes);
     for (counter, reload) in timers {
         dev.extend_from_slice(&counter.to_le_bytes());
@@ -146,6 +174,12 @@ pub fn save(core: &Core) -> Vec<u8> {
     }
     dev.extend_from_slice(&ppu_timing.0.to_le_bytes());
     dev.extend_from_slice(&ppu_timing.1.to_le_bytes());
+    for c in dma_prev {
+        dev.extend_from_slice(&c.to_le_bytes());
+    }
+    dev.push(stub_active as u8);
+    dev.push(hle_tag);
+    dev.extend_from_slice(&[0u8, 0u8]);
     w.section(SECTION_DEVICES, &dev);
 
     // Save-memory section (v2): chip kind tag + bank/id state + the
@@ -201,16 +235,29 @@ pub fn load(core: &mut Core, data: &[u8]) -> Result<(), SaveError> {
     for (id, payload) in sections {
         match id {
             SECTION_CPU => {
-                if payload.len() != 68 {
-                    return Err(SaveError::BadPayload { section: id });
-                }
                 let mut pr = Reader { data: payload, pos: 0 };
-                let mut regs = [0u32; 16];
-                for reg in regs.iter_mut() {
-                    *reg = pr.u32()?;
+                if version >= 3 {
+                    if payload.len() != 176 {
+                        return Err(SaveError::BadPayload { section: id });
+                    }
+                    let mut words = [0u32; 44];
+                    for w in words.iter_mut() {
+                        *w = pr.u32()?;
+                    }
+                    core.cpu.restore_full(&words);
+                } else {
+                    // v1/v2: active view only; banked shadows keep
+                    // whatever the receiving core already has.
+                    if payload.len() != 68 {
+                        return Err(SaveError::BadPayload { section: id });
+                    }
+                    let mut regs = [0u32; 16];
+                    for reg in regs.iter_mut() {
+                        *reg = pr.u32()?;
+                    }
+                    let cpsr = pr.u32()?;
+                    core.cpu.restore_regs(regs, cpsr);
                 }
-                let cpsr = pr.u32()?;
-                core.cpu.restore_regs(regs, cpsr);
             }
             SECTION_SCHEDULER => {
                 let mut pr = Reader { data: payload, pos: 0 };
@@ -231,19 +278,32 @@ pub fn load(core: &mut Core, data: &[u8]) -> Result<(), SaveError> {
                 core.scheduler.restore(now, &events);
             }
             SECTION_MEMORY => {
-                let expected =
-                    crate::bus::EWRAM_LEN + crate::bus::IWRAM_LEN + crate::bus::VRAM_LEN;
+                let base = crate::bus::EWRAM_LEN + crate::bus::IWRAM_LEN + crate::bus::VRAM_LEN;
+                let expected = if version >= 3 {
+                    base + crate::bus::PALETTE_LEN + crate::bus::OAM_LEN + crate::bus::IO_LEN
+                } else {
+                    base
+                };
                 if payload.len() != expected {
                     return Err(SaveError::BadPayload { section: id });
                 }
                 let (ew, rest) = payload.split_at(crate::bus::EWRAM_LEN);
-                let (iw, vr) = rest.split_at(crate::bus::IWRAM_LEN);
+                let (iw, rest) = rest.split_at(crate::bus::IWRAM_LEN);
+                let (vr, rest) = rest.split_at(crate::bus::VRAM_LEN);
                 core.bus.ewram.copy_from_slice(ew);
                 core.bus.iwram.copy_from_slice(iw);
                 core.bus.vram.copy_from_slice(vr);
+                if version >= 3 {
+                    let (pal, rest) = rest.split_at(crate::bus::PALETTE_LEN);
+                    let (oam, io) = rest.split_at(crate::bus::OAM_LEN);
+                    core.bus.palette.copy_from_slice(pal);
+                    core.bus.oam.copy_from_slice(oam);
+                    core.bus.io.copy_from_slice(io);
+                }
             }
             SECTION_DEVICES => {
-                if payload.len() != 28 {
+                let expected = if version >= 3 { 40 } else { 28 };
+                if payload.len() != expected {
                     return Err(SaveError::BadPayload { section: id });
                 }
                 let mut pr = Reader { data: payload, pos: 0 };
@@ -255,7 +315,17 @@ pub fn load(core: &mut Core, data: &[u8]) -> Result<(), SaveError> {
                 }
                 let line = pr.u16()?;
                 let cyc = pr.u64()?;
-                core.device_restore(pending, timers, (line, cyc));
+                if version >= 3 {
+                    let mut dma_prev = [0u16; 4];
+                    for c in dma_prev.iter_mut() {
+                        *c = pr.u16()?;
+                    }
+                    let stub_active = pr.u8()? != 0;
+                    let hle_tag = pr.u8()?;
+                    core.device_restore(pending, timers, (line, cyc), dma_prev, stub_active, hle_tag);
+                } else {
+                    core.device_restore(pending, timers, (line, cyc), [0; 4], false, 0);
+                }
             }
             SECTION_SAVEMEM => {
                 if payload.len() < 4 {
@@ -291,6 +361,12 @@ pub fn load(core: &mut Core, data: &[u8]) -> Result<(), SaveError> {
             // but it was still length- and CRC-checked above.
             _ => {}
         }
+    }
+    if version < 3 {
+        // Pre-v3 states carry no DMA latch copy; re-derive it from
+        // the restored IO page so an already-enabled channel does
+        // not spuriously retrigger.
+        core.latch_dma_prev();
     }
     Ok(())
 }

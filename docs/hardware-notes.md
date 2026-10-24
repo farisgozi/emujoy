@@ -42,6 +42,16 @@ Template:
   0x040000C4/0xC6 (12-byte channel stride from 0xB0). A Phase 4
   test first wrote CNT_H at 0xCA — that's DMA2's SAD high half —
   and the FIFO stayed silent with everything else correct.
+- **OBJ wins priority ties against BGs.** The Phase 4 compositor
+  originally sorted candidates by (priority, BG0<BG1<BG2<BG3<OBJ)
+  and a unit test asserted "BG wins the tie" — both wrong. GBATEK's
+  display order at equal priority is OBJ, BG0, BG1, BG2, BG3.
+  FOMT's title screen proves it in practice: the subtitle plank is
+  a prio-0 OBJ strip and the cast heads behind it are prio-0 BG3;
+  with the wrong order the heads paint over the subtitle text.
+  Found by diffing a reference photo + per-layer dumps + raw VRAM
+  tile decode — the tile data and palettes were correct all along;
+  only the compositor's tie-break was inverted.
 
 ## CPU — pipeline-visible PC (Phase 1)
 - Behaviour: reading R15 during execution yields instruction address
@@ -73,6 +83,40 @@ the wrong state and executed THUMB code as ARM (undefined-exception
 slide into unmapped space). The core now emulates the stub: push,
 sentinel LR (0x0000_03FC, intercepted before fetch), epilogue pops
 and restores CPSR from SPSR.
+
+## BIOS HLE — CpuSet/CpuFastSet count semantics (playable campaign)
+GBATEK: the control word's bits 0–20 are a count of *transfer
+units* — halfwords for 16-bit CpuSet, **words for CpuFastSet**
+(which always moves 32-bit words; the count must be a multiple of
+8, but it is NOT a count of 8-word blocks). Bit 24 = fixed source
+(fill), bit 26 selects 32-bit units for CpuSet only. Our HLE
+originally multiplied the count by 8 and ran 8× too far: FOMT
+zero-fills a 0x100-byte field at payload+4 of each 0x104-byte heap
+block with ctrl 0x01000040 (fill, 0x40 words), and the overrun
+marched past every buffer zeroing the heap block headers — the
+game's allocator then returned NULL for a 16-byte request and
+FOMT's wrapper waits forever on a NULL failure hook: the
+permanent white screen after pressing Start. Found by validating
+the game's heap block chain on every allocator entry (the chain
+broke exactly where the fills landed) plus a watchpoint on the
+corrupted header. Lesson: an HLE that is "close" corrupts state
+far from the call site; the symptom (allocator) was three layers
+away from the cause (BIOS copy semantics).
+
+## Save states — v3 completeness (playable campaign)
+Format v2 silently lost state: the CPU section held only the
+active registers + CPSR (banked shadows — including the IRQ
+stack pointer — were dropped, so the first IRQ after a load ran
+away with SP=0), and the memory section omitted palette RAM,
+OAM and the IO page (DISPCNT/registers restored as 0 → black
+screen). v3 snapshots the full register file (44 words: active +
+user bank + FIQ bank + per-mode pairs + all SPSRs), palette, OAM
+and IO, plus DMA edge latches, the BIOS-stub-active flag and the
+HLE wait state. v1/v2 files still load (banked state then keeps
+the receiving core's values — documented imperfection). Still
+approximate: APU channel state (music re-triggers via the game's
+engine) and PPU affine internal reference points (resync at the
+next frame start).
 
 ## CPU — the jsmolka quirk harvest (Phase 3)
 Each of these was found by a numbered jsmolka/gba-tests failure and

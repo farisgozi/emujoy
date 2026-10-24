@@ -8,3 +8,4 @@ description = "Linux desktop frontend: window, keyboard input, .sav persistence 
 [dependencies]
 gba-core = { path = "../gba-core" }
 minifb = "0.28"
+cpal = "0.15"

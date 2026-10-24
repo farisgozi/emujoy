@@ -124,7 +124,7 @@ fn window_masks_layers_per_region() {
 }
 
 #[test]
-fn obj_priority_tie_goes_to_bg_and_affine_obj_renders() {
+fn obj_priority_tie_goes_to_obj_and_affine_obj_renders() {
     let mut core = halt_core();
     two_bg_setup(&mut core, 0, 1);
     core.bus.write16(0x0400_0000, 0x0100 | (1 << 12)); // BG0 + OBJ
@@ -141,9 +141,13 @@ fn obj_priority_tie_goes_to_bg_and_affine_obj_renders() {
     }
     set_pal(&mut core, 256 + 1, 0x03E0); // OBJ palette 1 = green
     run_one(&mut core);
-    // Same priority 0: the background wins the tie (red, not green).
-    assert_eq!(core.framebuffer[0], 0xFFFF_0000, "tie at prio 0: BG in front");
-    // Drop BG0 to priority 1: now the affine sprite covers (0,0).
+    // Same priority 0: the OBJ wins the tie (GBATEK display order at
+    // equal priority is OBJ, BG0, BG1, BG2, BG3) — green, not red.
+    // (An earlier version of this test asserted the opposite from a
+    // misremembered rule; FOMT's title screen proved it wrong: its
+    // prio-0 OBJ subtitle plank must cover prio-0 BG3 heads.)
+    assert_eq!(core.framebuffer[0], 0xFF00_FF00, "tie at prio 0: OBJ in front");
+    // BG0 at priority 1 stays behind the prio-0 sprite as well.
     core.bus.write16(0x0400_0008, 0x0101); // BG0CNT prio 1
     run_one(&mut core);
     assert_eq!(core.framebuffer[0], 0xFF00_FF00, "affine OBJ in front at prio 0 vs BG prio 1");

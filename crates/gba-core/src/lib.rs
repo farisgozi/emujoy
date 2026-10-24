@@ -110,6 +110,14 @@ pub struct Core {
     hle_enabled: bool,
     /// Sound: PSG channels + Direct Sound FIFOs (Phase 4).
     pub apu: apu::Apu,
+    /// Debug watchpoint: when set, every change of the word at this
+    /// address is logged as (scheduler time, pc of the instruction
+    /// that was executing, new value). Diagnostic tooling for the
+    /// harness; `None` in normal operation (one read per step).
+    pub watch_addr: Option<u32>,
+    pub watch_val: u32,
+    pub watch_log: alloc::vec::Vec<(u64, u32, u32)>,
+    watch_pc: u32,
     /// Stereo samples produced since the last frame, pushed to the
     /// host at present time (interleaved L,R i16 @ 32768 Hz).
     audio_pending: alloc::vec::Vec<i16>,
@@ -133,6 +141,10 @@ impl Core {
             hle_enabled: false,
             apu: apu::Apu::new(),
             audio_pending: alloc::vec::Vec::new(),
+            watch_addr: None,
+            watch_val: 0,
+            watch_log: alloc::vec::Vec::new(),
+            watch_pc: 0,
         };
         core.set_io16(REG_KEYINPUT, 0x03FF);
         core
@@ -178,16 +190,29 @@ impl Core {
         self.bus.save.dirty = false;
     }
 
-    /// Device-state snapshot for the save-state format (v2 section).
-    pub(crate) fn device_snapshot(&self) -> ([u8; 2], [(u16, u16); 4], (u16, u64)) {
+    /// Device-state snapshot for the save-state format. v3 extends
+    /// the v2 payload with the DMA edge latches, the BIOS-stub flag
+    /// and the HLE wait state — without them a restored core can
+    /// retrigger a DMA or lose track of an in-flight stub return.
+    pub(crate) fn device_snapshot(
+        &self,
+    ) -> ([u8; 2], [(u16, u16); 4], (u16, u64), [u16; 4], bool, u8) {
         let mut timers = [(0u16, 0u16); 4];
         for (i, t) in self.timers.iter().enumerate() {
             timers[i] = (t.counter, t.reload);
         }
+        let hle_tag = match self.hle_wait {
+            None => 0,
+            Some(HleWait::AnyIrq) => 1,
+            Some(HleWait::VBlank) => 2,
+        };
         (
             self.pending_irq.to_le_bytes(),
             timers,
             self.ppu.timing_state(),
+            self.dma_prev_control,
+            self.bios_stub_active,
+            hle_tag,
         )
     }
 
@@ -196,6 +221,9 @@ impl Core {
         pending_irq: u16,
         timers: [(u16, u16); 4],
         ppu_timing: (u16, u64),
+        dma_prev: [u16; 4],
+        stub_active: bool,
+        hle_tag: u8,
     ) {
         self.pending_irq = pending_irq;
         for (i, (counter, reload)) in timers.iter().enumerate() {
@@ -204,6 +232,21 @@ impl Core {
             self.timers[i].displayed = *counter;
         }
         self.ppu.restore_timing(ppu_timing.0, ppu_timing.1);
+        self.dma_prev_control = dma_prev;
+        self.bios_stub_active = stub_active;
+        self.hle_wait = match hle_tag {
+            1 => Some(HleWait::AnyIrq),
+            2 => Some(HleWait::VBlank),
+            _ => None,
+        };
+    }
+
+    /// Re-latch the DMA edge detectors from the (restored) IO page.
+    /// Used when loading pre-v3 states, which carry no latch copy.
+    pub(crate) fn latch_dma_prev(&mut self) {
+        for ch in 0..4 {
+            self.dma_prev_control[ch] = dma::latch(&self.bus, ch).control;
+        }
     }
 
     /// Set up the register state the real BIOS leaves behind and jump
@@ -266,6 +309,7 @@ impl Core {
     /// Execute exactly one CPU instruction, then advance every device
     /// by its (Phase 1 approximate) cycle cost and service interrupts.
     pub fn step_instruction(&mut self) -> u32 {
+        self.watch_pc = self.cpu.pc();
         // Emulated BIOS stub epilogue: a game IRQ handler invoked
         // through the stub returns to this sentinel address; pop the
         // registers the stub pushed and resume the interrupted code
@@ -398,6 +442,19 @@ impl Core {
                 }
             }
             self.dma_prev_control[ch] = dma::latch(&self.bus, ch).control;
+        }
+
+        // Debug watchpoint (checked here because every step path
+        // funnels through advance_devices exactly once).
+        if let Some(addr) = self.watch_addr {
+            let v = self.bus.read32(addr);
+            if v != self.watch_val {
+                self.watch_val = v;
+                if self.watch_log.len() < 512 {
+                    let pc = self.watch_pc;
+                    self.watch_log.push((self.scheduler.now(), pc, v));
+                }
+            }
         }
     }
 
@@ -597,16 +654,21 @@ impl Core {
                 self.cpu.set_reg(0, isqrt(v));
             }
             // CpuSet (0x0B) / CpuFastSet (0x0C).
+            // Control: bits 0..20 = transfer count (halfwords for
+            // 16-bit CpuSet, words otherwise), bit 24 = fixed source
+            // (fill), bit 26 = 32-bit units (CpuSet only). CpuFastSet
+            // always moves 32-bit words and its count is in words too
+            // (the count must be a multiple of 8 — it is NOT a count
+            // of 8-word blocks; multiplying by 8 made FOMT's title
+            // transition memset march 0x700 bytes past its buffer and
+            // zero the heap block header behind it).
             0x0B | 0x0C => {
                 let mut src = self.cpu.reg(0);
                 let mut dst = self.cpu.reg(1);
                 let ctrl = self.cpu.reg(2);
                 let fill = ctrl & (1 << 24) != 0;
-                let wide = ctrl & (1 << 26) != 0;
-                let mut count = ctrl & 0x001F_FFFF;
-                if swi == 0x0C {
-                    count *= 8; // fast set counts 8-word blocks
-                }
+                let wide = swi == 0x0C || ctrl & (1 << 26) != 0;
+                let count = ctrl & 0x001F_FFFF;
                 for _ in 0..count {
                     if wide {
                         let v = self.bus.read32(src & !3);

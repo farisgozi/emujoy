@@ -186,6 +186,46 @@ impl Cpu {
         self.cpsr = cpsr;
     }
 
+    /// Full register-file snapshot for save-state format v3: the
+    /// active view, CPSR, every banked shadow and every SPSR, in a
+    /// fixed order (44 words). `restore_regs` alone is NOT enough for
+    /// a state taken mid-game: the IRQ/SVC banked stacks live in the
+    /// shadows, and losing them (zeroed shadows on a fresh core)
+    /// sends the CPU into unmapped space on the first IRQ return.
+    pub fn snapshot_full(&self) -> [u32; 44] {
+        let mut out = [0u32; 44];
+        out[0..16].copy_from_slice(&self.regs);
+        out[16] = self.cpsr;
+        out[17..24].copy_from_slice(&self.usr_regs);
+        out[24..31].copy_from_slice(&self.fiq_regs);
+        out[31..33].copy_from_slice(&self.svc_regs);
+        out[33..35].copy_from_slice(&self.abt_regs);
+        out[35..37].copy_from_slice(&self.und_regs);
+        out[37..39].copy_from_slice(&self.irq_regs);
+        out[39] = self.spsr_fiq;
+        out[40] = self.spsr_svc;
+        out[41] = self.spsr_abt;
+        out[42] = self.spsr_und;
+        out[43] = self.spsr_irq;
+        out
+    }
+
+    pub fn restore_full(&mut self, words: &[u32; 44]) {
+        self.regs.copy_from_slice(&words[0..16]);
+        self.cpsr = words[16];
+        self.usr_regs.copy_from_slice(&words[17..24]);
+        self.fiq_regs.copy_from_slice(&words[24..31]);
+        self.svc_regs.copy_from_slice(&words[31..33]);
+        self.abt_regs.copy_from_slice(&words[33..35]);
+        self.und_regs.copy_from_slice(&words[35..37]);
+        self.irq_regs.copy_from_slice(&words[37..39]);
+        self.spsr_fiq = words[39];
+        self.spsr_svc = words[40];
+        self.spsr_abt = words[41];
+        self.spsr_und = words[42];
+        self.spsr_irq = words[43];
+    }
+
     /// Change the low (control) byte of CPSR, swapping banked registers
     /// if the mode changes. Used by MSR and exception entry/return.
     pub fn set_cpsr_control(&mut self, new_cpsr: u32) {

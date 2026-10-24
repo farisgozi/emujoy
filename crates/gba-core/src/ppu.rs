@@ -302,43 +302,45 @@ fn render_scanline(bus: &Bus, fb: &mut [u32; SCREEN_W * SCREEN_H], y: usize, aff
             window_mask(bus, dispcnt, x, y, &obj.window)
         };
         // Candidate selection front-to-back: sort key is (priority,
-        // layer order BG0 < BG1 < BG2 < BG3 < OBJ < backdrop).
-        let mut top: Option<(u16, usize)> = None; // (color, layer id)
-        let mut second: Option<(u16, usize)> = None;
-        let mut best_key = (u16::MAX, usize::MAX);
-        let mut second_key = (u16::MAX, usize::MAX);
+        // layer order). At equal priority the hardware order is
+        // OBJ first, then BG0 < BG1 < BG2 < BG3 (GBATEK) — so the
+        // OBJ order component is 0 and BGs use bg+1. (Layer ids in
+        // `top`/`second` stay BG index / 4 = OBJ / 5 = backdrop for
+        // the BLDCNT target bits below.)
+        // Candidates carry their sort key: (color, layer id, key).
+        // Keys are distinct per layer (order component differs), so
+        // strict less-than never ties.
+        let mut top: Option<(u16, usize, (u16, usize))> = None;
+        let mut second: Option<(u16, usize, (u16, usize))> = None;
         for bg in 0..4usize {
             if !bg_on[bg] || mask & (1 << bg) == 0 {
                 continue;
             }
             if let Some(c) = bg_rows[bg][x] {
-                let key = (bg_prio[bg], bg);
-                if key < best_key {
+                let key = (bg_prio[bg], bg + 1);
+                if top.is_none() || key < top.unwrap().2 {
                     second = top;
-                    second_key = best_key;
-                    top = Some((c, bg));
-                    best_key = key;
-                } else if key < second_key {
-                    second = Some((c, bg));
-                    second_key = key;
+                    top = Some((c, bg, key));
+                } else if second.is_none() || key < second.unwrap().2 {
+                    second = Some((c, bg, key));
                 }
             }
         }
         let mut top_semi = false;
         if obj_on && mask & (1 << 4) != 0 {
             if let Some(op) = obj.px[x] {
-                let key = (op.prio, 4usize);
-                if key < best_key {
+                let key = (op.prio, 0usize);
+                if top.is_none() || key < top.unwrap().2 {
                     second = top;
-                    top = Some((op.color, 4));
+                    top = Some((op.color, 4, key));
                     top_semi = op.semi;
-                } else if key < second_key {
-                    second = Some((op.color, 4));
+                } else if second.is_none() || key < second.unwrap().2 {
+                    second = Some((op.color, 4, key));
                 }
             }
         }
         let (top_color, top_layer) = match top {
-            Some(t) => t,
+            Some((c, l, _)) => (c, l),
             None => (backdrop, 5usize),
         };
         // If the OBJ was pushed to second place, its semi flag does
@@ -351,13 +353,13 @@ fn render_scanline(bus: &Bus, fb: &mut [u32; SCREEN_W * SCREEN_H], y: usize, aff
             if top_semi && top_layer == 4 {
                 // Semi-transparent OBJ: always alpha-blend with what
                 // is below it (if that layer is a 2nd target).
-                if let Some((c2, l2)) = second {
+                if let Some((c2, l2, _)) = second {
                     if bldcnt & (1 << (8 + l2)) != 0 {
                         out = blend_alpha(top_color, c2, eva, evb);
                     }
                 }
             } else if mode_fx == 1 && in_t1 {
-                if let Some((c2, l2)) = second {
+                if let Some((c2, l2, _)) = second {
                     if bldcnt & (1 << (8 + l2)) != 0 {
                         out = blend_alpha(top_color, c2, eva, evb);
                     }

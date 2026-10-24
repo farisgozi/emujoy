@@ -20,6 +20,36 @@ this core: the intro plays, the title screen renders with its
 affine logo, and the title music plays. The boot blocker was the
 IRQ dispatch contract (see `docs/hardware-notes.md`, "BIOS stub").
 
+## Status: PLAYABLE — FOMT end-to-end ✅ (post-Phase-4 cleanup)
+
+The acceptance game now plays start to finish on this core:
+title → Start → New Game (name / birthday / farm / dog entry) →
+intro + flashback cutscenes → farmhouse free control (live HUD,
+clock) → farm work (tools till / water / plant for real) → Diary
+save in-game → battery `.sav` → cold-boot **Continue** resumes
+Year 1 Spring Day 2, 6:00 AM in the farmhouse. Three bugs fell
+during the campaign:
+
+- **Start hang (the big one)**: the BIOS HLE treated the
+  CpuFastSet count as 8-word blocks and copied 8× too much,
+  zeroing FOMT's heap headers; the game's allocator then failed
+  a 16-byte request and its wrapper waits forever. Fixed to
+  GBATEK semantics (count = words for CpuFastSet; see
+  `docs/hardware-notes.md`).
+- **Title subtitle smear**: inverted OBJ/BG priority tie-break
+  in the compositor (OBJ wins ties). Title now pixel-matches
+  the hardware reference.
+- **Save states were lossy**: format v3 snapshots the full
+  banked register file, palette, OAM and the IO page; a
+  mid-gameplay save/load round-trip is frame-identical.
+
+Also landed: frontend audio output via cpal (resampled from the
+core's 32768 Hz, silent fallback when no device exists), a
+watchpoint + heap-validator in the headless harness, and a
+warning-free workspace build. Verified: 56 cargo tests green,
+all five jsmolka suites pass, FOMT 1800-frame title hash
+0x5d91fd0feaa401a0, determinism OK.
+
 ## Status: Phase 4 — full PPU (affine/windows/effects), APU, EEPROM ✅
 
 - **Affine backgrounds**: Mode 1 BG2 and Mode 2 BG2/BG3 with
@@ -34,8 +64,8 @@ IRQ dispatch contract (see `docs/hardware-notes.md`, "BIOS stub").
   layer masks, alpha blending, brightness up/down, semi-transparent
   OBJ forcing alpha, mosaic (BG + OBJ), forced blank. The
   compositor works per-pixel on (priority, layer order) with a
-  true second-layer candidate for blending — OBJ loses same-
-  priority ties to BGs, as on hardware.
+  true second-layer candidate for blending — OBJ wins same-
+  priority ties against BGs, as on hardware.
 - **Objects**: affine sprites (incl. double-size), correct
   per-pixel priority against BGs, OBJ window sprites, mosaic;
   OBJ tile fetches in bitmap modes start at 0x14000.
@@ -61,15 +91,18 @@ IRQ dispatch contract (see `docs/hardware-notes.md`, "BIOS stub").
   jsmolka suites still ALL PASS;
   FOMT title screen frame hash unchanged from the Phase 4a
   milestone, determinism OK.
-- **Known cosmetic artifact**: FOMT's "Friends of Mineral Town"
-  subtitle band shows smeared tiles on the title screen while the
-  rest of the frame is pixel-clean — suspected mid-scanline effect
-  that the line-entry renderer approximates; under investigation,
-  not a compositor bug (attract-mode scenes render clean).
+- **Title-screen postscript**: FOMT's subtitle band initially
+  looked smeared while everything else was pixel-clean. Layer
+  isolation + raw VRAM decode + a reference photo proved the tile
+  data was always right — the compositor's priority tie-break was
+  inverted (at equal priority, OBJ must win over BGs; GBATEK's
+  order is OBJ, BG0, BG1, BG2, BG3). Fixed; the title screen now
+  matches reference hardware captures pixel-for-pixel in the
+  bands checked.
 - **Still open**: cycle-exact timing (planned as part of the
-  Phase 5 interpreter polish), frontend audio output device
-  (the core emits samples; minifb frontend doesn't play them yet),
-  more test-ROM families (ppu/sound suites).
+  Phase 5 interpreter polish), more test-ROM families
+  (ppu/sound suites). (Frontend audio output landed in the
+  playable cleanup — see the section above.)
 
 ## Status: Phase 3 — save hardware, BIOS HLE, frontend, external suites ✅
 
